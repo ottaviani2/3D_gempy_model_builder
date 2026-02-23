@@ -15,11 +15,21 @@
 """
 
 import os
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict
 
 from qgis.PyQt import uic
-from qgis.PyQt.QtWidgets import QDialog, QMessageBox, QFileDialog, QDockWidget, QVBoxLayout, QWidget, QPushButton, QSlider, QLabel, QHBoxLayout
+from qgis.PyQt.QtWidgets import (
+    QDialog, QMessageBox, QFileDialog, QDockWidget,
+    QVBoxLayout, QWidget, QPushButton, QSlider, QLabel,
+    QHBoxLayout, QListWidget, QTreeWidget, QTreeWidgetItem,
+    QComboBox, QLineEdit, QGroupBox, QSplitter, QAbstractItemView
+)
 from qgis.PyQt.QtCore import Qt
-from qgis.core import QgsApplication, QgsProject, QgsMapLayer, QgsMapLayerProxyModel, QgsMessageLog, Qgis
+from qgis.core import (
+    QgsApplication, QgsProject, QgsMapLayer,
+    QgsMapLayerProxyModel, QgsMessageLog, Qgis
+)
 from qgis.gui import QgsMapLayerComboBox, QgsMessageBar
 from qgis.utils import iface
 
@@ -27,10 +37,13 @@ from PyQt5.QtWidgets import QProgressDialog
 from PyQt5.QtCore import Qt
 
 from pyvistaqt import QtInteractor
-import pyvista as pv
 
-from scipy.spatial import Delaunay
-from stl import mesh
+try:
+    from .ps_insar_widget import PSInSARDialog
+    HAS_PS_INSAR = True
+except ImportError:
+    HAS_PS_INSAR = False
+import pyvista as pv
 
 import numpy as np
 
@@ -38,217 +51,600 @@ import numpy as np
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
     os.path.dirname(__file__), 'test_module_dialog_base.ui'))
 
+
+# ---------------------------------------------------------------------------
+# Phase 1 – Structural Group data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StructuralGroupConfig:
+    """Configuration for a single structural group in the GemPy model."""
+    group_name: str
+    formation_names: List[str] = field(default_factory=list)
+    relation_type: str = "ERODE"          # ERODE | ONLAP | FAULT | BASEMENT
+    fault_relation: str = "OFFSET_ALL"    # OFFSET_ALL | OFFSET_FORMATIONS
+    order_index: int = 0                  # 0 = youngest (top of stack)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 – Direct mesh extraction from GemPy solutions
+# ---------------------------------------------------------------------------
+
+class MeshExtractor:
+    """Extract meshes directly from geo_model.solutions.dc_meshes."""
+
+    def __init__(self, geo_model):
+        self.geo_model = geo_model
+        self.meshes: Dict[str, pv.PolyData] = {}
+        self.colors: Dict[str, list] = {}
+
+    def extract_all(self):
+        """Iterate dc_meshes, inverse-transform vertices, build PolyData."""
+        solutions = self.geo_model.solutions
+        structural_frame = self.geo_model.structural_frame
+
+        if not hasattr(solutions, 'dc_meshes') or solutions.dc_meshes is None:
+            QgsMessageLog.logMessage(
+                "No dc_meshes found in solutions – falling back to raw meshes",
+                "TestPlugin", Qgis.Warning)
+            return
+
+        input_transform = self.geo_model.input_transform
+
+        surface_index = 0
+        for group in structural_frame.structural_groups:
+            for element in group.elements:
+                name = element.name
+                try:
+                    dc_mesh = solutions.dc_meshes[surface_index]
+                except (IndexError, KeyError):
+                    QgsMessageLog.logMessage(
+                        f"No mesh at index {surface_index} for '{name}'",
+                        "TestPlugin", Qgis.Warning)
+                    surface_index += 1
+                    continue
+
+                try:
+                    vertices = np.array(dc_mesh.vertices, dtype=np.float64)
+                    edges = np.array(dc_mesh.edges, dtype=np.int64)
+                except AttributeError:
+                    try:
+                        vertices = np.array(dc_mesh[0], dtype=np.float64)
+                        edges = np.array(dc_mesh[1], dtype=np.int64)
+                    except Exception:
+                        surface_index += 1
+                        continue
+
+                if vertices.size == 0 or edges.size == 0:
+                    surface_index += 1
+                    continue
+
+                # Inverse-transform back to real-world coordinates
+                if input_transform is not None:
+                    try:
+                        vertices = input_transform.apply_inverse(vertices)
+                    except Exception:
+                        pass
+
+                # Build PyVista mesh
+                n_faces = edges.shape[0]
+                faces = np.column_stack([
+                    np.full(n_faces, 3, dtype=np.int64), edges
+                ]).ravel()
+                poly = pv.PolyData(vertices, faces)
+                self.meshes[name] = poly
+
+                # Get color from structural element
+                try:
+                    color = list(element.color)
+                except Exception:
+                    color = None
+                self.colors[name] = color
+
+                surface_index += 1
+
+    def export(self, output_folder, fmt="stl"):
+        """Save all meshes in the chosen format."""
+        fmt = fmt.lower()
+        ext_map = {"stl": ".stl", "vtk": ".vtk", "obj": ".obj", "ply": ".ply"}
+        ext = ext_map.get(fmt, ".stl")
+
+        exported = []
+        for name, poly in self.meshes.items():
+            safe_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in name)
+            path = os.path.join(output_folder, f"{safe_name}{ext}")
+            poly.save(path)
+            exported.append(path)
+            QgsMessageLog.logMessage(f"Exported: {path}", "TestPlugin", Qgis.Info)
+        return exported
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 – GeoTIFF geological map exporter
+# ---------------------------------------------------------------------------
+
+class GeoMapExporter:
+    """Export a geological map as GeoTIFF by slicing the lithology block."""
+
+    def __init__(self, geo_model, extent, resolution):
+        self.geo_model = geo_model
+        self.extent = extent        # [xmin, xmax, ymin, ymax, zmin, zmax]
+        self.resolution = resolution  # [nx, ny, nz]
+
+    def export_geotiff(self, output_path, z_level=None):
+        """Reshape lith_block to 3D and slice at z_level or top surface."""
+        try:
+            import rasterio
+            from rasterio.transform import from_bounds
+        except ImportError:
+            QgsMessageLog.logMessage(
+                "rasterio is required for GeoTIFF export",
+                "TestPlugin", Qgis.Warning)
+            return None
+
+        solutions = self.geo_model.solutions
+        if not hasattr(solutions, 'raw_arrays'):
+            QgsMessageLog.logMessage(
+                "No raw_arrays in solutions", "TestPlugin", Qgis.Warning)
+            return None
+
+        lith_block = solutions.raw_arrays.lith_block
+        nx, ny, nz = self.resolution
+
+        # Reshape to 3D (nz, ny, nx) – GemPy stores Z-fastest
+        try:
+            block_3d = lith_block.reshape(nz, ny, nx)
+        except ValueError:
+            QgsMessageLog.logMessage(
+                f"Cannot reshape lith_block ({lith_block.shape}) to "
+                f"({nz},{ny},{nx})",
+                "TestPlugin", Qgis.Warning)
+            return None
+
+        # Slice at the requested Z or at the top
+        if z_level is not None:
+            z_coords = np.linspace(self.extent[4], self.extent[5], nz)
+            z_idx = int(np.argmin(np.abs(z_coords - z_level)))
+        else:
+            z_idx = -1  # top slice
+
+        geo_map = block_3d[z_idx, :, :]
+        geo_map = np.flipud(geo_map).astype(np.float32)
+
+        xmin, xmax, ymin, ymax = self.extent[0:4]
+        transform = from_bounds(xmin, ymin, xmax, ymax, nx, ny)
+
+        with rasterio.open(
+            output_path, 'w', driver='GTiff',
+            height=ny, width=nx, count=1,
+            dtype='float32', transform=transform
+        ) as dst:
+            dst.write(geo_map, 1)
+
+        QgsMessageLog.logMessage(
+            f"GeoTIFF exported: {output_path}", "TestPlugin", Qgis.Info)
+        return output_path
+
+
+# ---------------------------------------------------------------------------
+# PyVista 3D Viewer Dialog
+# ---------------------------------------------------------------------------
+
 class PyVistaDialog(QDialog):
     """Standalone dialog for PyVista 3D visualization"""
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("GemPy 3D Model Viewer")
         self.resize(800, 600)
-        
+
         # Main layout
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
-        
+
         # Store current data
         self.surface_actors = {}
         self.export_folder = None
-        self.plotter_added = False  # Track if plotter was added
-        
+        self.plotter_added = False
+        self.mesh_extractor = None   # Phase 3: keep for export
+        self.geo_model = None
+        self.elevation_data = None
+        self.transform = None
+        self.plot_3d = False
+        self.topo_mesh = None        # Phase 3: topography pv mesh
+
         # Create controls
         self.create_controls()
-        
-        # Initialize plotter as None, will be created when needed
+
+        # Initialize plotter as None
         self.plotter = None
-        
-        # Set window to non-modal for proper interaction
+
+        # Non-modal
         self.setWindowModality(Qt.NonModal)
+
+    # ---- Controls --------------------------------------------------------
 
     def create_controls(self):
         controls_widget = QWidget()
         controls_layout = QHBoxLayout()
         controls_widget.setLayout(controls_layout)
-        
-        # Reset camera
+
         self.reset_btn = QPushButton("Reset View")
         self.reset_btn.clicked.connect(self.reset_camera)
         controls_layout.addWidget(self.reset_btn)
-        
-        # Clear plot
+
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.clicked.connect(self.clear_plot)
         controls_layout.addWidget(self.clear_btn)
-        
-        # Export STL
-        self.export_btn = QPushButton("Export STL")
-        self.export_btn.clicked.connect(self.export_stl_files)
+
+        # Phase 4: multi-format export button
+        self.export_btn = QPushButton("Export Meshes...")
+        self.export_btn.clicked.connect(self.export_meshes)
         controls_layout.addWidget(self.export_btn)
-        
-        # Opacity slider
+
         opacity_label = QLabel("Opacity:")
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(0, 100)
         self.opacity_slider.setValue(100)
         self.opacity_slider.valueChanged.connect(self.update_opacity)
-        
+
         controls_layout.addWidget(opacity_label)
         controls_layout.addWidget(self.opacity_slider)
         controls_layout.addStretch()
-        
+
         self.layout.addWidget(controls_widget)
 
-    def display_gempy_model(self, geo_model, export_folder=None, plot_3d=False, elevation_data=None, transform=None):
-        """
-        Display GemPy model using gpv.plot_3d with safe plotter management
-        """
+    # ---- Phase 3: Direct mesh display ------------------------------------
+
+    def display_gempy_model(self, geo_model, export_folder=None,
+                            plot_3d=False, elevation_data=None,
+                            transform=None):
+        """Display GemPy model using direct dc_meshes extraction."""
         try:
-            # Store export folder
             self.export_folder = export_folder
             self.plot_3d = plot_3d
             self.elevation_data = elevation_data
             self.transform = transform
+            self.geo_model = geo_model
 
-            # Set PyVista theme
             pv.set_plot_theme("document")
-            
-            # Import here to avoid circular imports
-            import gempy_viewer as gpv
-            import gempy as gp
-            
-            # Clear existing plotter first
+
+            # ---- Plotter management --------------------------------------
             if self.plotter is not None:
                 try:
-                    # Clear all actors and meshes
                     self.plotter.clear()
-                    # Reset camera
                     self.plotter.reset_camera()
-                    QgsMessageLog.logMessage("Cleared existing plotter", "TestPlugin", Qgis.Info)
                 except Exception as e:
-                    QgsMessageLog.logMessage(f"Error clearing plotter: {e}", "TestPlugin", Qgis.Warning)
-                    # If clearing fails, recreate the plotter
+                    QgsMessageLog.logMessage(
+                        f"Error clearing plotter: {e}",
+                        "TestPlugin", Qgis.Warning)
                     try:
                         self.plotter.close()
-                    except:
+                    except Exception:
                         pass
                     self.plotter = None
-            
-            # Create new plotter if needed
+
             if self.plotter is None:
                 self.plotter = QtInteractor(self)
-                # Add to layout if not already present
                 if not self.plotter_added:
                     self.layout.addWidget(self.plotter.interactor)
                     self.plotter_added = True
-            
-            # Create temporary plotter to extract mesh data
-            temp_plotter = gpv.plot_3d(geo_model, plotter_type='basic', show=False)
-            
-            # Clear surface actors dictionary for fresh start
+
+            # ---- Extract meshes via MeshExtractor ------------------------
             self.surface_actors = {}
-            
-            # Build legend entries
+            self.mesh_extractor = MeshExtractor(geo_model)
+            self.mesh_extractor.extract_all()
+
             legend_entries = []
+            opacity = self.opacity_slider.value() / 100.0
 
-            # Extract and add meshes
-            if hasattr(temp_plotter, 'surface_actors'):
-                for name, actor in temp_plotter.surface_actors.items():
-                    try:
-                        mesh = actor.mapper.dataset
-                        
-                        color = None
-                        if hasattr(actor, 'GetProperty'):
-                            prop = actor.GetProperty()
-                            vtk_color = prop.GetColor()
-                            color = list(vtk_color)
-                            legend_entries.append([name, color])
-
-                        # Add mesh to our plotter
-                        actor_new = self.plotter.add_mesh(
-                            mesh, 
-                            name=name,
-                            color=color,
-                            opacity=self.opacity_slider.value()/100.0,
-                            show_edges=False
-                        )
-
-                        if hasattr(actor, 'GetProperty'):
-                            if name == "topography":
-                                actor_new = self.plotter.add_mesh(
-                                    mesh, 
-                                    name=name,
-                                    color=color,
-                                    opacity=0.5,
-                                    show_edges=False
-                                )
-                            else:
-                                actor_new = self.plotter.add_mesh(
-                                    mesh, 
-                                    name=name,
-                                    color=color,
-                                    opacity=self.opacity_slider.value()/100.0,
-                                    show_edges=False
-                                )
-
-                        # Add legend to plotter
-                        if legend_entries:
-                            try:
-                                self.plotter.add_legend(
-                                    legend_entries,
-                                    bcolor="white",
-                                    size=(0.15, 0.15),
-                                    loc="upper right"
-                                )
-
-                            except Exception as e:
-                                QgsMessageLog.logMessage(f"Error adding legend: {e}", "TestPlugin", Qgis.Warning)
-
-                        
-                        self.surface_actors[name] = actor_new
-                        QgsMessageLog.logMessage(f"Added surface: {name}", "TestPlugin", Qgis.Info)
-                        
-                    except Exception as e:
-                        QgsMessageLog.logMessage(f"Error adding surface {name}: {e}", "TestPlugin", Qgis.Warning)
-                        continue
-            
-            # Add topography
-            if hasattr(temp_plotter, 'topography_actor') and temp_plotter.topography_actor:
+            for name, poly in self.mesh_extractor.meshes.items():
+                color = self.mesh_extractor.colors.get(name)
                 try:
-                    topo_mesh = temp_plotter.topography_actor.mapper.dataset
-                    self.plotter.add_mesh(
-                        topo_mesh, 
-                        name="topography",
-                        opacity=0.7,
-                        color='brown'
+                    actor = self.plotter.add_mesh(
+                        poly,
+                        name=name,
+                        color=color,
+                        opacity=opacity,
+                        show_edges=False
                     )
-                    QgsMessageLog.logMessage("Added topography", "TestPlugin", Qgis.Info)
+                    self.surface_actors[name] = actor
+                    if color:
+                        legend_entries.append([name, color])
+                    QgsMessageLog.logMessage(
+                        f"Added surface: {name}", "TestPlugin", Qgis.Info)
                 except Exception as e:
-                    QgsMessageLog.logMessage(f"Error adding topography: {e}", "TestPlugin", Qgis.Warning)
-            
-            # Safe cleanup of temporary plotter
-            try:
-                temp_plotter.close()
-            except:
-                pass
-            
-            # Enable interaction and render
+                    QgsMessageLog.logMessage(
+                        f"Error adding surface {name}: {e}",
+                        "TestPlugin", Qgis.Warning)
+
+            # If MeshExtractor produced nothing, fall back to gpv.plot_3d
+            if not self.surface_actors:
+                QgsMessageLog.logMessage(
+                    "MeshExtractor produced no meshes – "
+                    "falling back to gpv.plot_3d",
+                    "TestPlugin", Qgis.Warning)
+                self._display_via_gpv_fallback(geo_model, opacity)
+
+            # ---- Topography ---------------------------------------------
+            if plot_3d and elevation_data is not None and transform is not None:
+                self._add_topography_mesh(elevation_data, transform)
+
+            # ---- Legend --------------------------------------------------
+            if legend_entries:
+                try:
+                    self.plotter.add_legend(
+                        legend_entries,
+                        bcolor="white",
+                        size=(0.15, 0.15),
+                        loc="upper right"
+                    )
+                except Exception as e:
+                    QgsMessageLog.logMessage(
+                        f"Error adding legend: {e}",
+                        "TestPlugin", Qgis.Warning)
+
+            # ---- Finalize ------------------------------------------------
             self.plotter.enable_trackball_style()
             self.plotter.reset_camera()
             self.plotter.render()
-            
-            QgsMessageLog.logMessage(f"Successfully displayed {len(self.surface_actors)} surfaces", "TestPlugin", Qgis.Info)
-            
+
+            QgsMessageLog.logMessage(
+                f"Successfully displayed {len(self.surface_actors)} surfaces",
+                "TestPlugin", Qgis.Info)
+
         except Exception as e:
-            QgsMessageLog.logMessage(f"Error displaying GemPy model: {e}", "TestPlugin", Qgis.Critical)
+            QgsMessageLog.logMessage(
+                f"Error displaying GemPy model: {e}",
+                "TestPlugin", Qgis.Critical)
             import traceback
-            QgsMessageLog.logMessage(f"Traceback: {traceback.format_exc()}", "TestPlugin", Qgis.Critical)
+            QgsMessageLog.logMessage(
+                f"Traceback: {traceback.format_exc()}",
+                "TestPlugin", Qgis.Critical)
+
+    def _display_via_gpv_fallback(self, geo_model, opacity):
+        """Legacy fallback: use gpv.plot_3d to extract actor meshes."""
+        import gempy_viewer as gpv
+
+        temp_plotter = gpv.plot_3d(geo_model, plotter_type='basic', show=False)
+
+        if hasattr(temp_plotter, 'surface_actors'):
+            for name, actor in temp_plotter.surface_actors.items():
+                try:
+                    mesh_data = actor.mapper.dataset
+                    color = None
+                    if hasattr(actor, 'GetProperty'):
+                        vtk_color = actor.GetProperty().GetColor()
+                        color = list(vtk_color)
+
+                    actor_new = self.plotter.add_mesh(
+                        mesh_data,
+                        name=name,
+                        color=color,
+                        opacity=opacity,
+                        show_edges=False
+                    )
+                    self.surface_actors[name] = actor_new
+                except Exception as e:
+                    QgsMessageLog.logMessage(
+                        f"Fallback – error adding {name}: {e}",
+                        "TestPlugin", Qgis.Warning)
+
+        if hasattr(temp_plotter, 'topography_actor') and temp_plotter.topography_actor:
+            try:
+                topo_mesh = temp_plotter.topography_actor.mapper.dataset
+                self.plotter.add_mesh(
+                    topo_mesh, name="topography",
+                    opacity=0.7, color='brown')
+            except Exception:
+                pass
+
+        try:
+            temp_plotter.close()
+        except Exception:
+            pass
+
+    # ---- Phase 3: Structured-grid topography -----------------------------
+
+    def _add_topography_mesh(self, elevation_data, transform):
+        """Add topography as pv.StructuredGrid (faster than Delaunay)."""
+        try:
+            rows, cols = elevation_data.shape
+            x = np.arange(cols) * transform[0] + transform[2]
+            y = np.arange(rows) * transform[4] + transform[5]
+            X, Y = np.meshgrid(x, y)
+
+            Z = np.array(elevation_data, dtype=np.float64)
+            if np.ma.is_masked(elevation_data):
+                Z = np.ma.filled(Z, np.nan)
+
+            grid = pv.StructuredGrid(X, Y, Z)
+            self.topo_mesh = grid
+
+            self.plotter.add_mesh(
+                grid, name="topography",
+                opacity=0.7, color='brown',
+                show_edges=False
+            )
+            QgsMessageLog.logMessage(
+                "Added topography (StructuredGrid)", "TestPlugin", Qgis.Info)
+        except Exception as e:
+            QgsMessageLog.logMessage(
+                f"Error adding topography mesh: {e}",
+                "TestPlugin", Qgis.Warning)
+
+    # ---- Phase 4: Multi-format export ------------------------------------
+
+    def export_meshes(self):
+        """Export geological meshes + topography in user-chosen format."""
+        if not self.export_folder:
+            QMessageBox.warning(
+                self, "Export",
+                "No output folder set. Please set one in the main dialog.")
+            return
+
+        if not self.surface_actors and self.topo_mesh is None:
+            QMessageBox.warning(
+                self, "Export",
+                "Nothing to export – display a model first.")
+            return
+
+        # Format selection dialog
+        fmt_dialog = QDialog(self)
+        fmt_dialog.setWindowTitle("Export Format")
+        fmt_layout = QVBoxLayout()
+        fmt_dialog.setLayout(fmt_layout)
+
+        fmt_layout.addWidget(QLabel("Select export format:"))
+        fmt_combo = QComboBox()
+        fmt_combo.addItems(["STL", "VTK", "OBJ", "PLY"])
+        fmt_layout.addWidget(fmt_combo)
+
+        geo_tiff_cb = None
+        try:
+            import rasterio  # noqa: F401
+            from PyQt5.QtWidgets import QCheckBox
+            geo_tiff_cb = QCheckBox("Also export geological map (GeoTIFF)")
+            fmt_layout.addWidget(geo_tiff_cb)
+        except ImportError:
+            pass
+
+        btn_box_layout = QHBoxLayout()
+        ok_btn = QPushButton("Export")
+        cancel_btn = QPushButton("Cancel")
+        ok_btn.clicked.connect(fmt_dialog.accept)
+        cancel_btn.clicked.connect(fmt_dialog.reject)
+        btn_box_layout.addWidget(ok_btn)
+        btn_box_layout.addWidget(cancel_btn)
+        fmt_layout.addLayout(btn_box_layout)
+
+        if fmt_dialog.exec_() != QDialog.Accepted:
+            return
+
+        fmt = fmt_combo.currentText().lower()
+        ext_map = {"stl": ".stl", "vtk": ".vtk", "obj": ".obj", "ply": ".ply"}
+        ext = ext_map.get(fmt, ".stl")
+
+        # Export geological surfaces
+        if self.mesh_extractor and self.mesh_extractor.meshes:
+            self.mesh_extractor.export(self.export_folder, fmt)
+        else:
+            # Fallback: export from actors
+            for name, actor in self.surface_actors.items():
+                if name in ("topography", "topography_cont"):
+                    continue
+                try:
+                    mesh_data = actor.mapper.dataset
+                    safe = "".join(
+                        c if c.isalnum() or c in (' ', '_', '-') else '_'
+                        for c in name)
+                    path = os.path.join(self.export_folder, f"{safe}{ext}")
+                    mesh_data.save(path)
+                    QgsMessageLog.logMessage(
+                        f"Exported: {path}", "TestPlugin", Qgis.Info)
+                except Exception as e:
+                    QgsMessageLog.logMessage(
+                        f"Export error for {name}: {e}",
+                        "TestPlugin", Qgis.Warning)
+
+        # Export topography
+        if self.topo_mesh is not None:
+            topo_path = os.path.join(self.export_folder, f"Topography{ext}")
+            try:
+                self.topo_mesh.save(topo_path)
+                QgsMessageLog.logMessage(
+                    f"Exported topography: {topo_path}",
+                    "TestPlugin", Qgis.Info)
+            except Exception as e:
+                QgsMessageLog.logMessage(
+                    f"Error exporting topography: {e}",
+                    "TestPlugin", Qgis.Warning)
+        elif self.plot_3d and self.elevation_data is not None:
+            # Legacy STL topography export via numpy-stl
+            self._export_topo_stl_legacy()
+
+        # Optional GeoTIFF export
+        if (geo_tiff_cb is not None and geo_tiff_cb.isChecked()
+                and self.geo_model is not None):
+            extent = list(self.geo_model.grid.regular_grid.extent)
+            resolution = list(self.geo_model.grid.regular_grid.resolution)
+            exporter = GeoMapExporter(self.geo_model, extent, resolution)
+            tiff_path = os.path.join(self.export_folder, "geological_map.tif")
+            exporter.export_geotiff(tiff_path)
+
+        QMessageBox.information(
+            self, "Export",
+            f"Meshes exported to:\n{self.export_folder}")
+
+    def _export_topo_stl_legacy(self):
+        """Legacy topography STL export via scipy Delaunay + numpy-stl."""
+        try:
+            from scipy.spatial import Delaunay
+            from stl import mesh as stl_mesh_mod
+
+            elevation_data = self.elevation_data
+            transform = self.transform
+
+            rows, cols = elevation_data.shape
+            x = np.arange(cols) * transform[0] + transform[2]
+            y = np.arange(rows) * transform[4] + transform[5]
+            X, Y = np.meshgrid(x, y)
+
+            X_flat = X.flatten()
+            Y_flat = Y.flatten()
+            Z_flat = np.array(elevation_data).flatten()
+
+            if np.ma.is_masked(elevation_data):
+                mask = ~elevation_data.mask.flatten()
+                X_flat = X_flat[mask]
+                Y_flat = Y_flat[mask]
+                Z_flat = Z_flat[mask]
+
+            points_2d = np.column_stack([X_flat, Y_flat])
+            tri = Delaunay(points_2d)
+            triangles = tri.simplices
+            points_3d = np.column_stack([X_flat, Y_flat, Z_flat])
+
+            num_triangles = len(triangles)
+            data = np.zeros(num_triangles, dtype=stl_mesh_mod.Mesh.dtype)
+            for i, triangle in enumerate(triangles):
+                data['vectors'][i] = points_3d[triangle]
+
+            stl_mesh_obj = stl_mesh_mod.Mesh(data, remove_empty_areas=True)
+            stl_path = os.path.join(self.export_folder, "Topography.stl")
+            stl_mesh_obj.save(stl_path)
+            QgsMessageLog.logMessage(
+                f"Exported legacy topography: {stl_path}",
+                "TestPlugin", Qgis.Info)
+        except Exception as e:
+            QgsMessageLog.logMessage(
+                f"Legacy topo export error: {e}",
+                "TestPlugin", Qgis.Warning)
+
+    # ---- Standard plot controls ------------------------------------------
 
     def clear_plot(self):
         """Clear all objects from the plot"""
         if self.plotter is not None:
             self.plotter.clear()
             self.surface_actors = {}
-            self.plotter.render()  # Render after clearing
-            QgsMessageLog.logMessage("Plot cleared successfully", "TestPlugin", Qgis.Info)
+            self.plotter.render()
+            QgsMessageLog.logMessage(
+                "Plot cleared successfully", "TestPlugin", Qgis.Info)
+
+    def reset_camera(self):
+        """Reset camera to show all objects"""
+        if self.plotter is not None:
+            self.plotter.reset_camera()
+
+    def update_opacity(self, value):
+        """Update opacity of all objects"""
+        opacity = value / 100.0
+        if self.plotter is not None:
+            for actor in self.plotter.renderer.actors.values():
+                if hasattr(actor, 'GetProperty'):
+                    actor.GetProperty().SetOpacity(opacity)
+            self.plotter.render()
 
     def closeEvent(self, event):
         """Handle dialog close event"""
@@ -259,108 +655,368 @@ class PyVistaDialog(QDialog):
         """Safely cleanup the plotter"""
         try:
             if hasattr(self, 'plotter') and self.plotter is not None:
-                # Clear all actors first
                 self.plotter.clear()
-                
-                # Close plotter
                 self.plotter.close()
                 self.plotter = None
-                self.plotter_added = False  # Reset flag
-                
-            # Clear surface actors
+                self.plotter_added = False
             self.surface_actors = {}
-            
         except Exception as e:
-            QgsMessageLog.logMessage(f"Error during plotter cleanup: {e}", "TestPlugin", Qgis.Warning)
+            QgsMessageLog.logMessage(
+                f"Error during plotter cleanup: {e}",
+                "TestPlugin", Qgis.Warning)
             self.plotter = None
             self.plotter_added = False
-        
-    def export_stl_files(self):
-        if not self.export_folder:
-            return  # Or show a message box
-        
-        if not self.surface_actors:
-            return  # Or show a message box
-        
-        # for internal surfaces
-        for name, actor in self.surface_actors.items():
-            if name != "topography" and name != "topography_cont":
-                mesh_tmp = actor.mapper.dataset
-                stl_path = os.path.join(self.export_folder, f"{name}.stl")
-                mesh_tmp.save(stl_path)
-                QgsMessageLog.logMessage(f"Exported: {stl_path}", "TestPlugin", Qgis.Info)
 
 
-        if self.plot_3d:
-            # for topography
-            # Create coordinate arrays
-            elevation_data = self.elevation_data
-            transform = self.transform
+# ---------------------------------------------------------------------------
+# Phase 2 – Structural Groups Configuration Dialog
+# ---------------------------------------------------------------------------
 
-            rows, cols = elevation_data.shape
-            x = np.arange(cols) * transform[0] + transform[2]  # X coordinates
-            y = np.arange(rows) * transform[4] + transform[5]  # Y coordinates
-            
-            # Create meshgrid
-            X, Y = np.meshgrid(x, y)
-            
-            # Flatten arrays and create points (x, y) for triangulation
-            X_flat = X.flatten()
-            Y_flat = Y.flatten()
-            Z_flat = elevation_data.flatten()
-            
-            # Remove masked/nodata points if present
-            if np.ma.is_masked(elevation_data):
-                mask = ~elevation_data.mask.flatten()
-                X_flat = X_flat[mask]
-                Y_flat = Y_flat[mask]
-                Z_flat = Z_flat[mask]
-            
-            # Create 2D points for Delaunay (only x, y)
-            points_2d = np.column_stack([X_flat, Y_flat])
-            
-            # Perform Delaunay triangulation on 2D points
-            tri = Delaunay(points_2d)
-            triangles = tri.simplices
-            
-            # Create 3D points (x, y, z) for the mesh
-            points_3d = np.column_stack([X_flat, Y_flat, Z_flat])
-            
-            # Create STL mesh
-            num_triangles = len(triangles)
-            data = np.zeros(num_triangles, dtype=mesh.Mesh.dtype)
-            
-            for i, triangle in enumerate(triangles):
-                data['vectors'][i] = points_3d[triangle]
-            
-            # Create the STL mesh object
-            stl_mesh = mesh.Mesh(data, remove_empty_areas=True)
-            
-            # Save the mesh to file
-            stl_path = os.path.join(self.export_folder, f"Topography.stl")
-            stl_mesh.save(stl_path)
-            QgsMessageLog.logMessage(f"Exported: {stl_path}", "TestPlugin", Qgis.Info)
-    
-    def reset_camera(self):
-        """Reset camera to show all objects"""
-        self.plotter.reset_camera()
-    
-    def clear_plot(self):
-        """Clear all objects from the plot"""
-        self.plotter.clear()
-        self.surface_actors = {}
-    
-    def update_opacity(self, value):
-        """Update opacity of all objects"""
-        opacity = value / 100.0
-        
-        # Update all actors' opacity
-        for actor in self.plotter.renderer.actors.values():
-            if hasattr(actor, 'GetProperty'):
-                actor.GetProperty().SetOpacity(opacity)
-        
-        self.plotter.render()
+class StructuralGroupDialog(QDialog):
+    """Modal dialog for configuring structural groups."""
 
+    def __init__(self, formation_names, existing_configs=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Structural Groups")
+        self.resize(700, 500)
+        self.setWindowModality(Qt.ApplicationModal)
+
+        self.all_formation_names = list(formation_names)
+        self.configs: List[StructuralGroupConfig] = []
+        self._build_ui()
+
+        # Populate with existing configs or auto-initialise
+        if existing_configs:
+            self._load_configs(existing_configs)
+        else:
+            self._auto_initialise()
+
+    # ---- UI construction -------------------------------------------------
+
+    def _build_ui(self):
+        root = QVBoxLayout()
+        self.setLayout(root)
+
+        splitter = QSplitter(Qt.Horizontal)
+        root.addWidget(splitter, stretch=1)
+
+        # ---- Left: unassigned formations ---------------------------------
+        left_box = QGroupBox("Available Formations")
+        left_layout = QVBoxLayout()
+        left_box.setLayout(left_layout)
+
+        self.lst_available = QListWidget()
+        self.lst_available.setSelectionMode(
+            QAbstractItemView.ExtendedSelection)
+        left_layout.addWidget(self.lst_available)
+        splitter.addWidget(left_box)
+
+        # ---- Centre: buttons ---------------------------------------------
+        btn_widget = QWidget()
+        btn_layout = QVBoxLayout()
+        btn_widget.setLayout(btn_layout)
+
+        btn_layout.addStretch()
+        self.btn_add = QPushButton(">>")
+        self.btn_add.setToolTip("Add selected formations to group")
+        self.btn_add.clicked.connect(self._add_to_group)
+        btn_layout.addWidget(self.btn_add)
+
+        self.btn_remove = QPushButton("<<")
+        self.btn_remove.setToolTip("Remove from group")
+        self.btn_remove.clicked.connect(self._remove_from_group)
+        btn_layout.addWidget(self.btn_remove)
+
+        self.btn_up = QPushButton("Up")
+        self.btn_up.setToolTip("Move group up (younger)")
+        self.btn_up.clicked.connect(self._move_group_up)
+        btn_layout.addWidget(self.btn_up)
+
+        self.btn_down = QPushButton("Down")
+        self.btn_down.setToolTip("Move group down (older)")
+        self.btn_down.clicked.connect(self._move_group_down)
+        btn_layout.addWidget(self.btn_down)
+        btn_layout.addStretch()
+
+        splitter.addWidget(btn_widget)
+
+        # ---- Right: groups tree ------------------------------------------
+        right_box = QGroupBox("Structural Groups (youngest at top)")
+        right_layout = QVBoxLayout()
+        right_box.setLayout(right_layout)
+
+        grp_btn_layout = QHBoxLayout()
+        self.btn_new_group = QPushButton("New Group")
+        self.btn_new_group.clicked.connect(self._new_group)
+        grp_btn_layout.addWidget(self.btn_new_group)
+
+        self.btn_del_group = QPushButton("Delete Group")
+        self.btn_del_group.clicked.connect(self._delete_group)
+        grp_btn_layout.addWidget(self.btn_del_group)
+        right_layout.addLayout(grp_btn_layout)
+
+        self.tree_groups = QTreeWidget()
+        self.tree_groups.setHeaderLabels(["Name"])
+        self.tree_groups.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.tree_groups.currentItemChanged.connect(self._on_group_selected)
+        right_layout.addWidget(self.tree_groups)
+
+        splitter.addWidget(right_box)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 0)
+        splitter.setStretchFactor(2, 3)
+
+        # ---- Bottom: group properties -----------------------------------
+        props_box = QGroupBox("Group Properties")
+        props_layout = QHBoxLayout()
+        props_box.setLayout(props_layout)
+
+        props_layout.addWidget(QLabel("Name:"))
+        self.txt_group_name = QLineEdit()
+        self.txt_group_name.textEdited.connect(self._on_name_edited)
+        props_layout.addWidget(self.txt_group_name)
+
+        props_layout.addWidget(QLabel("Relation:"))
+        self.cmb_relation = QComboBox()
+        self.cmb_relation.addItems(["ERODE", "ONLAP", "FAULT", "BASEMENT"])
+        self.cmb_relation.currentTextChanged.connect(self._on_relation_changed)
+        props_layout.addWidget(self.cmb_relation)
+
+        self.lbl_fault_rel = QLabel("Fault relation:")
+        self.cmb_fault_rel = QComboBox()
+        self.cmb_fault_rel.addItems(["OFFSET_ALL", "OFFSET_FORMATIONS"])
+        self.cmb_fault_rel.currentTextChanged.connect(
+            self._on_fault_rel_changed)
+        props_layout.addWidget(self.lbl_fault_rel)
+        props_layout.addWidget(self.cmb_fault_rel)
+        self.lbl_fault_rel.setVisible(False)
+        self.cmb_fault_rel.setVisible(False)
+
+        root.addWidget(props_box)
+
+        # ---- OK / Cancel -------------------------------------------------
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self._validate_and_accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        root.addLayout(btn_row)
+
+    # ---- Auto-initialise (backward-compatible) ---------------------------
+
+    def _auto_initialise(self):
+        """Faults -> individual FAULT groups; rest -> one ERODE group."""
+        fault_names = [f for f in self.all_formation_names
+                       if "Fault" in str(f)]
+        non_fault = [f for f in self.all_formation_names
+                     if "Fault" not in str(f)]
+
+        idx = 0
+        for fn in fault_names:
+            cfg = StructuralGroupConfig(
+                group_name=fn,
+                formation_names=[fn],
+                relation_type="FAULT",
+                fault_relation="OFFSET_ALL",
+                order_index=idx
+            )
+            self.configs.append(cfg)
+            idx += 1
+
+        if non_fault:
+            cfg = StructuralGroupConfig(
+                group_name="default_formation",
+                formation_names=list(non_fault),
+                relation_type="ERODE",
+                order_index=idx
+            )
+            self.configs.append(cfg)
+
+        self._refresh_tree()
+        self._refresh_available()
+
+    def _load_configs(self, configs):
+        """Load existing configurations."""
+        self.configs = [StructuralGroupConfig(
+            group_name=c.group_name,
+            formation_names=list(c.formation_names),
+            relation_type=c.relation_type,
+            fault_relation=c.fault_relation,
+            order_index=c.order_index
+        ) for c in configs]
+        self._refresh_tree()
+        self._refresh_available()
+
+    # ---- Refresh helpers -------------------------------------------------
+
+    def _assigned_formations(self):
+        assigned = set()
+        for cfg in self.configs:
+            assigned.update(cfg.formation_names)
+        return assigned
+
+    def _refresh_available(self):
+        self.lst_available.clear()
+        assigned = self._assigned_formations()
+        for name in self.all_formation_names:
+            if name not in assigned:
+                self.lst_available.addItem(name)
+
+    def _refresh_tree(self):
+        self.tree_groups.clear()
+        for cfg in self.configs:
+            group_item = QTreeWidgetItem([cfg.group_name])
+            group_item.setData(0, Qt.UserRole, cfg)
+            for fn in cfg.formation_names:
+                child = QTreeWidgetItem([fn])
+                group_item.addChild(child)
+            self.tree_groups.addTopLevelItem(group_item)
+            group_item.setExpanded(True)
+
+    def _selected_group_cfg(self):
+        item = self.tree_groups.currentItem()
+        if item is None:
+            return None, None
+        # Navigate to top-level
+        while item.parent() is not None:
+            item = item.parent()
+        cfg = item.data(0, Qt.UserRole)
+        return item, cfg
+
+    # ---- Slots -----------------------------------------------------------
+
+    def _new_group(self):
+        idx = len(self.configs)
+        name = f"group_{idx + 1}"
+        cfg = StructuralGroupConfig(
+            group_name=name, order_index=idx)
+        self.configs.append(cfg)
+        self._refresh_tree()
+
+    def _delete_group(self):
+        item, cfg = self._selected_group_cfg()
+        if cfg is None:
+            return
+        self.configs.remove(cfg)
+        self._refresh_tree()
+        self._refresh_available()
+
+    def _add_to_group(self):
+        item, cfg = self._selected_group_cfg()
+        if cfg is None:
+            QMessageBox.information(
+                self, "Info", "Select a group first.")
+            return
+        selected = [i.text() for i in self.lst_available.selectedItems()]
+        if not selected:
+            return
+        cfg.formation_names.extend(selected)
+        self._refresh_tree()
+        self._refresh_available()
+
+    def _remove_from_group(self):
+        current = self.tree_groups.currentItem()
+        if current is None or current.parent() is None:
+            return
+        parent = current.parent()
+        cfg = parent.data(0, Qt.UserRole)
+        formation = current.text(0)
+        if formation in cfg.formation_names:
+            cfg.formation_names.remove(formation)
+        self._refresh_tree()
+        self._refresh_available()
+
+    def _move_group_up(self):
+        item, cfg = self._selected_group_cfg()
+        if cfg is None:
+            return
+        idx = self.configs.index(cfg)
+        if idx == 0:
+            return
+        self.configs[idx], self.configs[idx - 1] = (
+            self.configs[idx - 1], self.configs[idx])
+        self._refresh_tree()
+        self.tree_groups.setCurrentItem(
+            self.tree_groups.topLevelItem(idx - 1))
+
+    def _move_group_down(self):
+        item, cfg = self._selected_group_cfg()
+        if cfg is None:
+            return
+        idx = self.configs.index(cfg)
+        if idx >= len(self.configs) - 1:
+            return
+        self.configs[idx], self.configs[idx + 1] = (
+            self.configs[idx + 1], self.configs[idx])
+        self._refresh_tree()
+        self.tree_groups.setCurrentItem(
+            self.tree_groups.topLevelItem(idx + 1))
+
+    def _on_group_selected(self, current, previous):
+        item, cfg = self._selected_group_cfg()
+        if cfg is None:
+            self.txt_group_name.clear()
+            return
+        self.txt_group_name.setText(cfg.group_name)
+        self.cmb_relation.setCurrentText(cfg.relation_type)
+        is_fault = cfg.relation_type == "FAULT"
+        self.lbl_fault_rel.setVisible(is_fault)
+        self.cmb_fault_rel.setVisible(is_fault)
+        if is_fault:
+            self.cmb_fault_rel.setCurrentText(cfg.fault_relation)
+
+    def _on_name_edited(self, text):
+        item, cfg = self._selected_group_cfg()
+        if cfg is None:
+            return
+        cfg.group_name = text
+        item.setText(0, text)
+
+    def _on_relation_changed(self, text):
+        item, cfg = self._selected_group_cfg()
+        if cfg is None:
+            return
+        cfg.relation_type = text
+        is_fault = text == "FAULT"
+        self.lbl_fault_rel.setVisible(is_fault)
+        self.cmb_fault_rel.setVisible(is_fault)
+
+    def _on_fault_rel_changed(self, text):
+        _, cfg = self._selected_group_cfg()
+        if cfg is None:
+            return
+        cfg.fault_relation = text
+
+    # ---- Validation & accept ---------------------------------------------
+
+    def _validate_and_accept(self):
+        assigned = self._assigned_formations()
+        unassigned = set(self.all_formation_names) - assigned
+        if unassigned:
+            QMessageBox.warning(
+                self, "Validation Error",
+                f"The following formations are not assigned to any group:\n"
+                f"{', '.join(sorted(unassigned))}\n\n"
+                "Every formation must belong to exactly one group.")
+            return
+
+        # Reassign order indices
+        for i, cfg in enumerate(self.configs):
+            cfg.order_index = i
+
+        self.accept()
+
+    def get_configs(self):
+        """Return the configured StructuralGroupConfig list."""
+        return list(self.configs)
+
+
+# ---------------------------------------------------------------------------
+# Main Plugin Dialog
+# ---------------------------------------------------------------------------
 
 class testDialog(QDialog, FORM_CLASS):
     def __init__(self, parent=None):
@@ -385,28 +1041,26 @@ class testDialog(QDialog, FORM_CLASS):
         self.progress_dialog = None
         self.pyvista_panel = None
 
+        # Phase 1: structural group configs (None = auto-configure later)
+        self.structural_group_configs: Optional[List[StructuralGroupConfig]] = None
+
         self.setup_layer_combos()
         self.connect_signals()
 
-        # 0. Assign default value to variables
+        # Default values
         self.input_x.setText("10")
         self.input_y.setText("10")
         self.input_z.setText("10")
         self.model_deep.setText("500")
-        self.plot_checkbox.setChecked(False)  # Default = checked
+        self.plot_checkbox.setChecked(False)
         self.output_folder.setText("Select output folder...")
 
-        # Get all layers in the project
+        # Auto-select known layers
         layers = QgsProject.instance().mapLayers().values()
+        layers = [l for l in layers if l.source().lower().endswith('.csv')]
 
-        # Filter only CSV layers (by source extension)
-        layers = [layer for layer in layers if layer.source().lower().endswith('.csv')]
-        
-        # Find and select both layers
         layer_i_found = False
         layer_o_found = False
-
-        # Find the layer with the specified name
         for layer in layers:
             if layer.name() == "layer_i":
                 self.GeologyComboBox.setLayer(layer)
@@ -414,154 +1068,280 @@ class testDialog(QDialog, FORM_CLASS):
             elif layer.name() == "layer_o":
                 self.OrientationComboBox.setLayer(layer)
                 layer_o_found = True
-            # Break if both layers are found
             if layer_i_found and layer_o_found:
                 break
-            
+
     def setup_layer_combos(self):
         """Setup the layer combo boxes"""
-        if hasattr(self, 'GeologyComboBox') and isinstance(self.GeologyComboBox, QgsMapLayerComboBox):
-            self.GeologyComboBox.setFilters(QgsMapLayerProxyModel.VectorLayer)
+        if hasattr(self, 'GeologyComboBox') and isinstance(
+                self.GeologyComboBox, QgsMapLayerComboBox):
+            self.GeologyComboBox.setFilters(
+                QgsMapLayerProxyModel.VectorLayer)
 
-        if hasattr(self, 'OrientationComboBox') and isinstance(self.OrientationComboBox, QgsMapLayerComboBox):
-            self.OrientationComboBox.setFilters(QgsMapLayerProxyModel.VectorLayer)
+        if hasattr(self, 'OrientationComboBox') and isinstance(
+                self.OrientationComboBox, QgsMapLayerComboBox):
+            self.OrientationComboBox.setFilters(
+                QgsMapLayerProxyModel.VectorLayer)
 
-        if hasattr(self, 'DTMComboBox') and isinstance(self.DTMComboBox, QgsMapLayerComboBox):
-            self.DTMComboBox.setFilters(QgsMapLayerProxyModel.RasterLayer)
+        if hasattr(self, 'DTMComboBox') and isinstance(
+                self.DTMComboBox, QgsMapLayerComboBox):
+            self.DTMComboBox.setFilters(
+                QgsMapLayerProxyModel.RasterLayer)
 
     def connect_signals(self):
         """Connect signals from UI elements"""
-        
-        if hasattr(self, 'GeologyComboBox') and isinstance(self.GeologyComboBox, QgsMapLayerComboBox):
-            self.GeologyComboBox.layerChanged.connect(self.on_geology_layer_changed)
+        if hasattr(self, 'GeologyComboBox') and isinstance(
+                self.GeologyComboBox, QgsMapLayerComboBox):
+            self.GeologyComboBox.layerChanged.connect(
+                self.on_geology_layer_changed)
 
-        if hasattr(self, 'OrientationComboBox') and isinstance(self.OrientationComboBox, QgsMapLayerComboBox):
-            self.OrientationComboBox.layerChanged.connect(self.on_orientation_layer_changed)
+        if hasattr(self, 'OrientationComboBox') and isinstance(
+                self.OrientationComboBox, QgsMapLayerComboBox):
+            self.OrientationComboBox.layerChanged.connect(
+                self.on_orientation_layer_changed)
 
-        if hasattr(self, 'DTMComboBox') and isinstance(self.DTMComboBox, QgsMapLayerComboBox):
-            self.DTMComboBox.layerChanged.connect(self.on_DTM_layer_changed)
-        
+        if hasattr(self, 'DTMComboBox') and isinstance(
+                self.DTMComboBox, QgsMapLayerComboBox):
+            self.DTMComboBox.layerChanged.connect(
+                self.on_DTM_layer_changed)
+
         if hasattr(self, 'button_box'):
             self.button_box.accepted.connect(self.accept_selection)
             self.button_box.rejected.connect(self.reject)
 
         self.browseButton.clicked.connect(self.browse_output_folder)
 
-        #QgsMessageLog.logMessage("=== SIGNALS CONNECTED ===", "TestPlugin", Qgis.Info)
+        # Phase 2: structural groups button
+        if hasattr(self, 'btnConfigureGroups'):
+            self.btnConfigureGroups.clicked.connect(
+                self.open_structural_groups_dialog)
+
+        # PS-InSAR analysis button
+        if hasattr(self, 'btnPSInSAR'):
+            if HAS_PS_INSAR:
+                self.btnPSInSAR.clicked.connect(self.open_ps_insar_dialog)
+            else:
+                self.btnPSInSAR.setEnabled(False)
+                self.btnPSInSAR.setToolTip(
+                    "PS-InSAR module not available (missing dependencies)")
 
     def create_or_show_pyvista_panel(self):
         """Create PyVista panel if it doesn't exist, or show it if hidden"""
         if self.pyvista_panel is None:
-            self.pyvista_panel = PyVistaPanel(iface.mainWindow())
+            self.pyvista_panel = PyVistaDialog(iface.mainWindow())
             iface.addDockWidget(Qt.RightDockWidgetArea, self.pyvista_panel)
         else:
             self.pyvista_panel.setVisible(True)
-            self.pyvista_panel.raise_()  # Bring to front
+            self.pyvista_panel.raise_()
 
     def on_geology_layer_changed(self, layer):
         self.selected_geology_layer = layer
         if layer:
             self.geology_layer_path = layer.source()
-        
+
     def on_orientation_layer_changed(self, layer):
         self.selected_orientation_layer = layer
         if layer:
             self.orientation_layer_path = layer.source()
-         
+
     def on_DTM_layer_changed(self, layer):
         self.selected_DTM_layer = layer
         if layer:
             self.DTM_layer_path = layer.source()
 
     def browse_output_folder(self):
-        # Get current folder from line edit (if any) as starting directory
         current_folder = self.output_folder.text().strip()
-        
-        # Use current folder as starting directory, or user's home if empty/invalid
         if current_folder and os.path.exists(current_folder):
             start_dir = current_folder
         else:
             start_dir = os.path.expanduser("~")
-        
-        # Open folder selection dialog
+
         self.folder_path = QFileDialog.getExistingDirectory(
-            parent=None,  # or self if you want to pass the parent widget
+            parent=None,
             caption="Select Output Folder",
             directory=start_dir
         )
-        
-        # If user selected a folder (didn't cancel), update the line edit
         if self.folder_path:
             self.output_folder.setText(self.folder_path)
-           
+
+    # ---- Phase 1: formation / group helpers ------------------------------
+
+    def get_all_formation_names(self):
+        """Read unique formation names from the geology layer."""
+        if (not self.selected_geology_layer
+                or self.selected_geology_layer.type() != QgsMapLayer.VectorLayer):
+            return []
+
+        fields = self.selected_geology_layer.fields()
+
+        # Try by field name first, fall back to index 4
+        field_name = None
+        idx = fields.indexFromName("formation")
+        if idx >= 0:
+            field_name = "formation"
+        else:
+            if len(fields) > 4:
+                field_name = fields[4].name()
+            else:
+                return []
+
+        names = set()
+        for feature in self.selected_geology_layer.getFeatures():
+            val = feature[field_name]
+            if val:
+                names.add(str(val))
+        return sorted(names)
+
+    def _auto_configure_structural_groups(self):
+        """Backward-compatible auto-detection of structural groups."""
+        all_names = self.get_all_formation_names()
+        if not all_names:
+            return
+
+        fault_names = [n for n in all_names if "Fault" in n]
+        non_fault = [n for n in all_names if "Fault" not in n]
+
+        configs = []
+        idx = 0
+
+        for fn in fault_names:
+            configs.append(StructuralGroupConfig(
+                group_name=fn,
+                formation_names=[fn],
+                relation_type="FAULT",
+                fault_relation="OFFSET_ALL",
+                order_index=idx
+            ))
+            idx += 1
+
+        if non_fault:
+            configs.append(StructuralGroupConfig(
+                group_name="default_formation",
+                formation_names=list(non_fault),
+                relation_type="ERODE",
+                order_index=idx
+            ))
+
+        self.structural_group_configs = configs
+
+        QgsMessageLog.logMessage(
+            f"Auto-configured {len(configs)} structural group(s)",
+            "TestPlugin", Qgis.Info)
+
+    # ---- Phase 2: open structural groups dialog --------------------------
+
+    def open_structural_groups_dialog(self):
+        """Open the structural groups configuration dialog."""
+        all_names = self.get_all_formation_names()
+        if not all_names:
+            QMessageBox.warning(
+                self, "Warning",
+                "Please select a geology layer first.")
+            return
+
+        dlg = StructuralGroupDialog(
+            all_names, self.structural_group_configs, self)
+
+        if dlg.exec_() == QDialog.Accepted:
+            self.structural_group_configs = dlg.get_configs()
+            count = len(self.structural_group_configs)
+            if hasattr(self, 'lblGroupsStatus'):
+                self.lblGroupsStatus.setText(
+                    f"{count} group(s) configured")
+            QgsMessageLog.logMessage(
+                f"User configured {count} structural group(s)",
+                "TestPlugin", Qgis.Info)
+
+    # ---- PS-InSAR dialog --------------------------------------------------
+
+    def open_ps_insar_dialog(self):
+        """Open the PS-InSAR moving area detection dialog."""
+        output_folder = self.output_folder.text().strip()
+        if output_folder == "Select output folder...":
+            output_folder = ""
+
+        dtm_layer = self.selected_DTM_layer
+
+        dlg = PSInSARDialog(
+            output_folder=output_folder,
+            dtm_layer=dtm_layer,
+            parent=self,
+        )
+        dlg.exec_()
+
+    # ---- accept / run ----------------------------------------------------
+
     def accept_selection(self):
-        QgsMessageLog.logMessage("=== START NEW MODEL ===", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            "=== START NEW MODEL ===", "TestPlugin", Qgis.Info)
+
         if not self.selected_geology_layer:
-            QMessageBox.warning(self, "Warning", "Please select a geology layer.")
+            QMessageBox.warning(
+                self, "Warning", "Please select a geology layer.")
             return
 
         if not self.selected_orientation_layer:
-            QMessageBox.warning(self, "Warning", "Please select an orientation layer.")
+            QMessageBox.warning(
+                self, "Warning", "Please select an orientation layer.")
             return
 
         if self.selected_geology_layer == self.selected_orientation_layer:
-            QMessageBox.warning(self, "Warning", "Geology and Orientation layers must be different.")
+            QMessageBox.warning(
+                self, "Warning",
+                "Geology and Orientation layers must be different.")
             return
 
-        # Print the paths when OK is clicked
-        QgsMessageLog.logMessage("=== SELECTED LAYER PATHS ===", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"Geology path: {self.geology_layer_path}", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"Orientation path: {self.orientation_layer_path}", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"DTM path: {self.DTM_layer_path}", "TestPlugin", Qgis.Info)
-        
-        self.fault_names = self.get_fault_list()
+        QgsMessageLog.logMessage(
+            "=== SELECTED LAYER PATHS ===", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"Geology path: {self.geology_layer_path}",
+            "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"Orientation path: {self.orientation_layer_path}",
+            "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"DTM path: {self.DTM_layer_path}",
+            "TestPlugin", Qgis.Info)
 
+        # Phase 1: auto-configure groups if user hasn't done it manually
+        if self.structural_group_configs is None:
+            self._auto_configure_structural_groups()
+
+        # Parse dimension values
         if hasattr(self, 'input_x') and hasattr(self.input_x, 'text'):
             x_text = self.input_x.text().strip()
-            if x_text:
-                self.x_value = int(x_text)
-            else:
-                self.x_value = None
-                QgsMessageLog.logMessage("X value is empty", "TestPlugin", Qgis.Info)
-            
+            self.x_value = int(x_text) if x_text else None
+
         if hasattr(self, 'input_y') and hasattr(self.input_y, 'text'):
             y_text = self.input_y.text().strip()
-            if y_text:
-                self.y_value = int(y_text)
-            else:
-                self.y_value = None
-                QgsMessageLog.logMessage("Y value is empty", "TestPlugin", Qgis.Info)
+            self.y_value = int(y_text) if y_text else None
 
         if hasattr(self, 'input_z') and hasattr(self.input_z, 'text'):
             z_text = self.input_z.text().strip()
-            if z_text:
-                self.z_value = int(z_text)
-            else:
-                self.z_value = None
-                QgsMessageLog.logMessage("Z value is empty", "TestPlugin", Qgis.Info)
-            
+            self.z_value = int(z_text) if z_text else None
+
         if hasattr(self, 'model_deep') and hasattr(self.model_deep, 'text'):
             model_deep_text = self.model_deep.text().strip()
-            if model_deep_text:
-                self.model_deep_value = float(model_deep_text)
-            else:
-                self.model_deep_value = None
-                QgsMessageLog.logMessage("model_deep value is empty", "TestPlugin", Qgis.Info)
+            self.model_deep_value = (
+                float(model_deep_text) if model_deep_text else None)
 
         self.plot_3d = self.plot_checkbox.isChecked()
 
-        QgsMessageLog.logMessage("=== MODEL DIMENSION VALUES ===", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"X: {self.x_value}", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"Y: {self.y_value}", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"Z: {self.z_value}", "TestPlugin", Qgis.Info)
-
-        QgsMessageLog.logMessage("=== MODEL DEEP VALUES ===", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"Deep: {self.model_deep_value}", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"Plot topography: {self.plot_3d}", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            "=== MODEL DIMENSION VALUES ===", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"X: {self.x_value}", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"Y: {self.y_value}", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"Z: {self.z_value}", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"Deep: {getattr(self, 'model_deep_value', None)}",
+            "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"Plot topography: {self.plot_3d}", "TestPlugin", Qgis.Info)
 
         self.accept()
-        
-        # Call GemPy core
         self.gempy_core_plugin()
 
     def get_all_values(self):
@@ -579,76 +1359,42 @@ class testDialog(QDialog, FORM_CLASS):
             }
         }
 
-    def get_fault_list(self):
-        # Read geology attribute table
-        fault_values = []
-        fault_names = []  # Final list
-    
-        if self.selected_geology_layer and self.selected_geology_layer.type() == QgsMapLayer.VectorLayer:
-            fields = self.selected_geology_layer.fields()
-            if len(fields) > 0:
-                formation = fields[4].name()  # Get column "formation"
-
-                for feature in self.selected_geology_layer.getFeatures():
-                    value = feature[formation]
-                    if value and "Fault" in str(value):  # check if contains "Fault"
-                        fault_values.append(value)
-
-                # GROUP BY FAULT NAMES - Get unique fault names
-                fault_names = list(set(fault_values))  # Remove duplicates
-                fault_names.sort()  # Optional: sort alphabetically
-                
-                QgsMessageLog.logMessage("=== UNIQUE FAULT NAMES ===", "TestPlugin", Qgis.Info)
-                for fault_name in fault_names:
-                    QgsMessageLog.logMessage(str(fault_name), "TestPlugin", Qgis.Info)
-                
-                QgsMessageLog.logMessage(f"Total unique faults found: {len(fault_names)}", "TestPlugin", Qgis.Info)
-
-                return fault_names
-                
-        else:
-            QgsMessageLog.logMessage("Geology layer is not a vector layer", "TestPlugin", Qgis.Info)
+    # ---- Progress helpers ------------------------------------------------
 
     def show_qgis_progress(self, message="Processing..."):
-        self.progress_dialog = QProgressDialog(message, "Cancel", 0, 100, self)
+        self.progress_dialog = QProgressDialog(
+            message, "Cancel", 0, 100, self)
         self.progress_dialog.setWindowModality(Qt.WindowModal)
         self.progress_dialog.setAutoClose(True)
         self.progress_dialog.setAutoReset(True)
         self.progress_dialog.setValue(0)
         self.progress_dialog.show()
         QgsApplication.processEvents()
-    
+
     def update_qgis_progress(self, value, message=None):
         if self.progress_dialog:
             self.progress_dialog.setValue(value)
             if message:
                 self.progress_dialog.setLabelText(message)
             QgsApplication.processEvents()
-            
-            # Check if user canceled
             if self.progress_dialog.wasCanceled():
-                return False  # Signal to stop processing
+                return False
         return True
-    
+
     def hide_qgis_progress(self, final_message="Processing completed"):
         if self.progress_dialog:
             self.progress_dialog.close()
             self.progress_dialog = None
-        
-        # Show completion message
         iface.messageBar().pushMessage(
-            "Success", 
-            final_message, 
-            level=Qgis.Success,
-            duration=3
-        )
+            "Success", final_message,
+            level=Qgis.Success, duration=3)
+
+    # ---- GemPy core logic ------------------------------------------------
 
     def gempy_core_plugin(self):
-        import matplotlib.pyplot as plt
         import gempy as gp
         import gempy_viewer as gpv
         import rasterio
-        import pyvista as pv
 
         self.show_qgis_progress("Initializing GemPy model...")
 
@@ -658,36 +1404,37 @@ class testDialog(QDialog, FORM_CLASS):
             bounds = src.bounds
             elevation_data = src.read(1)
             if src.nodata is not None:
-                elevation_data = np.ma.masked_equal(elevation_data, src.nodata)
-        
+                elevation_data = np.ma.masked_equal(
+                    elevation_data, src.nodata)
+
             crs = src.crs
             transform = src.transform
             min_x, min_y, max_x, max_y = bounds
-            
+
             if isinstance(elevation_data, np.ma.MaskedArray):
+                min_elevation = elevation_data.min()
+                max_elevation = elevation_data.max()
+            else:
                 min_elevation = elevation_data.min()
                 max_elevation = elevation_data.max()
 
         self.update_qgis_progress(5, "Loading geological data...")
 
-        # Compute ranges for each axis
+        # Compute ranges
         x_range = max_x - min_x
         y_range = max_y - min_y
         z_range = max_elevation - min_elevation
 
-        # Take 10% of each range
         x_buffer = 0.06 * x_range
         y_buffer = 0.06 * y_range
         z_buffer = 0.06 * z_range
 
-        x_block = x_range/self.x_value
-        y_block = y_range/self.y_value
-        z_block = z_range/self.z_value
+        x_block = x_range / self.x_value
+        y_block = y_range / self.y_value
+        z_block = z_range / self.z_value
 
-        # Take the maximum buffer across axes
         buffer_size = max(x_buffer, y_buffer, z_buffer)
-        block_size = max(x_block,y_block,z_block)
-
+        block_size = max(x_block, y_block, z_block)
         buffer_size = max(buffer_size, block_size)
 
         if self.plot_3d:
@@ -696,125 +1443,193 @@ class testDialog(QDialog, FORM_CLASS):
         # 1. Create model
         geo_model: gp.data.GeoModel = gp.create_geomodel(
             project_name='Model_1',
-            extent=[min_x-buffer_size, max_x+buffer_size, min_y-buffer_size, max_y+buffer_size, min_elevation-self.model_deep_value-buffer_size, max_elevation+buffer_size],
-            resolution=[self.x_value,self.y_value,self.z_value],
+            extent=[
+                min_x - buffer_size, max_x + buffer_size,
+                min_y - buffer_size, max_y + buffer_size,
+                min_elevation - self.model_deep_value - buffer_size,
+                max_elevation + buffer_size
+            ],
+            resolution=[self.x_value, self.y_value, self.z_value],
             importer_helper=gp.data.ImporterHelper(
                 path_to_orientations=self.orientation_layer_path,
                 path_to_surface_points=self.geology_layer_path,
             )
         )
 
-        self.update_qgis_progress(10, "Set faults...")
+        self.update_qgis_progress(10, "Configuring structural groups...")
 
-        # Store fault elements for processing
-        fault_elements = []
-        default_group: gp.data.StructuralGroup = geo_model.structural_frame.get_group_by_name("default_formation")
+        # ------------------------------------------------------------------
+        # Phase 1: configure structural groups from self.structural_group_configs
+        # ------------------------------------------------------------------
+        if self.structural_group_configs:
+            default_group = geo_model.structural_frame.get_group_by_name(
+                "default_formation")
 
-        # First cycle: Get all fault elements and remove them from default group
-        for fault_name in self.fault_names:
-            try:
-                fault_element: gp.data.StructuralElement = geo_model.structural_frame.get_element_by_name(fault_name)
-                fault_elements.append(fault_element)
-                default_group.elements.remove(fault_element)
-            except Exception as e:
-                QgsMessageLog.logMessage(f"Warning: Could not process {fault_name}: {e}", "TestPlugin", Qgis.Critical)
-                
+            # Map relation strings to GemPy enums
+            relation_map = {
+                "ERODE": gp.data.StackRelationType.ERODE,
+                "ONLAP": gp.data.StackRelationType.ONLAP,
+                "FAULT": gp.data.StackRelationType.FAULT,
+                "BASEMENT": gp.data.StackRelationType.BASEMENT,
+            }
+            fault_rel_map = {
+                "OFFSET_ALL": gp.data.FaultsRelationSpecialCase.OFFSET_ALL,
+                "OFFSET_FORMATIONS": gp.data.FaultsRelationSpecialCase.OFFSET_FORMATIONS,
+            }
 
-        # Second cycle: Create structural groups for each fault
-        for i, (fault_name, fault_element) in enumerate(zip(self.fault_names, fault_elements)):
-            try:
-                group_name = f"fault_series_{i+1}"
-                
-                gp.add_structural_group(
-                    model=geo_model,
-                    group_index=i,
-                    structural_group_name=group_name,
-                    elements=[fault_element],
-                    structural_relation=gp.data.StackRelationType.FAULT,
-                    fault_relations=gp.data.FaultsRelationSpecialCase.OFFSET_ALL
-                )
-                
-                QgsMessageLog.logMessage(f"Created structural group '{group_name}' for {fault_name}", "TestPlugin", Qgis.Info)
-                
-            except Exception as e:
-                QgsMessageLog.logMessage(f"Error creating group for {fault_name}: {e}", "TestPlugin", Qgis.Critical)
+            # Collect elements to remove from default group
+            elements_to_remove = []
+            for cfg in self.structural_group_configs:
+                for fn in cfg.formation_names:
+                    try:
+                        el = geo_model.structural_frame.get_element_by_name(fn)
+                        elements_to_remove.append(el)
+                    except Exception:
+                        pass
+
+            # Remove from default group
+            for el in elements_to_remove:
+                try:
+                    default_group.elements.remove(el)
+                except ValueError:
+                    pass
+
+            # Create structural groups (ordered youngest-first)
+            for i, cfg in enumerate(self.structural_group_configs):
+                try:
+                    elements = []
+                    for fn in cfg.formation_names:
+                        try:
+                            el = geo_model.structural_frame.get_element_by_name(fn)
+                            elements.append(el)
+                        except Exception as e:
+                            QgsMessageLog.logMessage(
+                                f"Warning: element '{fn}' not found: {e}",
+                                "TestPlugin", Qgis.Warning)
+
+                    if not elements:
+                        continue
+
+                    relation = relation_map.get(
+                        cfg.relation_type,
+                        gp.data.StackRelationType.ERODE)
+
+                    kwargs = dict(
+                        model=geo_model,
+                        group_index=i,
+                        structural_group_name=cfg.group_name,
+                        elements=elements,
+                        structural_relation=relation,
+                    )
+
+                    if cfg.relation_type == "FAULT":
+                        kwargs["fault_relations"] = fault_rel_map.get(
+                            cfg.fault_relation,
+                            gp.data.FaultsRelationSpecialCase.OFFSET_ALL)
+
+                    gp.add_structural_group(**kwargs)
+
+                    QgsMessageLog.logMessage(
+                        f"Created group '{cfg.group_name}' "
+                        f"({cfg.relation_type}) with "
+                        f"{len(elements)} element(s)",
+                        "TestPlugin", Qgis.Info)
+
+                except Exception as e:
+                    QgsMessageLog.logMessage(
+                        f"Error creating group '{cfg.group_name}': {e}",
+                        "TestPlugin", Qgis.Critical)
+
+            # Remove empty default group
+            if not default_group.elements:
+                try:
+                    geo_model.structural_frame.structural_groups.remove(
+                        default_group)
+                    QgsMessageLog.logMessage(
+                        "Removed empty default_formation group",
+                        "TestPlugin", Qgis.Info)
+                except ValueError:
+                    pass
 
         self.update_qgis_progress(15, "Set topography data...")
 
         if self.plot_3d:
-            x_coords = np.linspace(min_x, max_x, elevation_data.shape[1])
-            y_coords = np.linspace(min_y, max_y, elevation_data.shape[0])
-
-            XX, YY = np.meshgrid(x_coords,np.flipud(y_coords))
-            topo_input = np.hstack([XX.reshape(-1,1), YY.reshape(-1,1), elevation_data.reshape(-1,1)])
-
+            x_coords = np.linspace(
+                min_x, max_x, elevation_data.shape[1])
+            y_coords = np.linspace(
+                min_y, max_y, elevation_data.shape[0])
+            XX, YY = np.meshgrid(x_coords, np.flipud(y_coords))
+            topo_input = np.hstack([
+                XX.reshape(-1, 1),
+                YY.reshape(-1, 1),
+                elevation_data.reshape(-1, 1)
+            ])
             gp.set_topography_from_arrays(
                 grid=geo_model.grid,
-                xyz_vertices = topo_input
+                xyz_vertices=topo_input
             )
         else:
-            QgsMessageLog.logMessage("User chose not to cut the model using Topography", "TestPlugin", Qgis.Info)
+            QgsMessageLog.logMessage(
+                "User chose not to cut the model using Topography",
+                "TestPlugin", Qgis.Info)
 
         self.update_qgis_progress(20, "Computing the model...")
 
         # 3. Compute
-        geo_model.input_transform.apply_anisotropy(gp.data.GlobalAnisotropy.NONE)
+        geo_model.input_transform.apply_anisotropy(
+            gp.data.GlobalAnisotropy.NONE)
         gp.compute_model(geo_model)
 
-        
-        """Updated section for displaying 3D model in gempy_core_plugin"""
-        
+        # 4. Display
         self.update_qgis_progress(90, "Displaying 3D model...")
 
         try:
-            # Option 1: Reuse existing dialog if it exists and is visible
-            if hasattr(self, 'pyvista_panel') and self.pyvista_panel and self.pyvista_panel.isVisible():
-                # Just clear and reuse
-                self.pyvista_panel.display_gempy_model(geo_model, self.folder_path)
+            if (hasattr(self, 'pyvista_panel')
+                    and self.pyvista_panel
+                    and self.pyvista_panel.isVisible()):
+                self.pyvista_panel.display_gempy_model(
+                    geo_model, self.folder_path,
+                    self.plot_3d, elevation_data, transform)
                 self.pyvista_panel.raise_()
-                
             else:
-                # Close any existing dialog first
                 if hasattr(self, 'pyvista_panel') and self.pyvista_panel:
                     try:
                         self.pyvista_panel.close()
                         self.pyvista_panel.deleteLater()
-                    except:
+                    except Exception:
                         pass
                     finally:
                         self.pyvista_panel = None
-                
-                # Force garbage collection and process events
+
                 import gc
                 gc.collect()
                 QgsApplication.processEvents()
-                
-                # Create FRESH dialog
+
                 self.pyvista_panel = PyVistaDialog(iface.mainWindow())
                 self.pyvista_panel.setWindowModality(Qt.NonModal)
-                
-                # Show BEFORE displaying model
                 self.pyvista_panel.show()
                 self.pyvista_panel.raise_()
-                
-                # Force window to be fully realized
                 QgsApplication.processEvents()
-                
-                # Now display the model
-                self.pyvista_panel.display_gempy_model(geo_model, self.folder_path, self.plot_3d, elevation_data, transform)
-            
-            # Additional processing to ensure display
+
+                self.pyvista_panel.display_gempy_model(
+                    geo_model, self.folder_path,
+                    self.plot_3d, elevation_data, transform)
+
             QgsApplication.processEvents()
-            
             self.hide_qgis_progress("3D model displayed successfully!")
-            QgsMessageLog.logMessage("3D model displayed in PyVista panel", "TestPlugin", Qgis.Info)
-            
+            QgsMessageLog.logMessage(
+                "3D model displayed in PyVista panel",
+                "TestPlugin", Qgis.Info)
+
         except Exception as e:
-            QgsMessageLog.logMessage(f"Error creating PyVista plotter: {e}", "TestPlugin", Qgis.Critical)
+            QgsMessageLog.logMessage(
+                f"Error creating PyVista plotter: {e}",
+                "TestPlugin", Qgis.Critical)
             import traceback
-            QgsMessageLog.logMessage(f"Traceback: {traceback.format_exc()}", "TestPlugin", Qgis.Critical)
+            QgsMessageLog.logMessage(
+                f"Traceback: {traceback.format_exc()}",
+                "TestPlugin", Qgis.Critical)
             return None
-        
 
 
 # --------- Example usage outside ----------
@@ -829,6 +1644,9 @@ def example_plugin_run():
         orientation_path = paths.get("orientation")
         DTM_path = paths.get("DTM")
 
-        QgsMessageLog.logMessage(f"Geology path: {geology_path}", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"Orientation path: {orientation_path}", "TestPlugin", Qgis.Info)
-        QgsMessageLog.logMessage(f"DTM path: {DTM_path}", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"Geology path: {geology_path}", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"Orientation path: {orientation_path}", "TestPlugin", Qgis.Info)
+        QgsMessageLog.logMessage(
+            f"DTM path: {DTM_path}", "TestPlugin", Qgis.Info)
