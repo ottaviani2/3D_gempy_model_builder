@@ -1718,12 +1718,12 @@ def example_plugin_run():
     dialog = testDialog()
 
     if dialog.exec_() == QDialog.Accepted:
-        paths = dialog.get_layer_paths()
-        print(paths)
+        values = dialog.get_all_values()
+        print(values)
 
-        geology_path = paths.get("geology")
-        orientation_path = paths.get("orientation")
-        DTM_path = paths.get("DTM")
+        geology_path = values["paths"].get("geology")
+        orientation_path = values["paths"].get("orientation")
+        DTM_path = values["paths"].get("DTM")
 
         QgsMessageLog.logMessage(
             f"Geology path: {geology_path}", "TestPlugin", Qgis.Info)
