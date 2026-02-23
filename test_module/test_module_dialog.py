@@ -1028,10 +1028,14 @@ class testDialog(QDialog, FORM_CLASS):
         self.selected_geology_layer = None
         self.selected_orientation_layer = None
         self.selected_DTM_layer = None
+        self.selected_sar_surface_layer = None
+        self.selected_sar_orientation_layer = None
 
         self.geology_layer_path = None
         self.orientation_layer_path = None
         self.DTM_layer_path = None
+        self.sar_surface_layer_path = None
+        self.sar_orientation_layer_path = None
 
         # Store coordinate values
         self.x_value = None
@@ -1088,6 +1092,20 @@ class testDialog(QDialog, FORM_CLASS):
             self.DTMComboBox.setFilters(
                 QgsMapLayerProxyModel.RasterLayer)
 
+        if hasattr(self, 'SARSurfaceComboBox') and isinstance(
+                self.SARSurfaceComboBox, QgsMapLayerComboBox):
+            self.SARSurfaceComboBox.setFilters(
+                QgsMapLayerProxyModel.VectorLayer)
+            self.SARSurfaceComboBox.setAllowEmptyLayer(True)
+            self.SARSurfaceComboBox.setCurrentIndex(0)  # empty = no SAR
+
+        if hasattr(self, 'SAROrientationComboBox') and isinstance(
+                self.SAROrientationComboBox, QgsMapLayerComboBox):
+            self.SAROrientationComboBox.setFilters(
+                QgsMapLayerProxyModel.VectorLayer)
+            self.SAROrientationComboBox.setAllowEmptyLayer(True)
+            self.SAROrientationComboBox.setCurrentIndex(0)
+
     def connect_signals(self):
         """Connect signals from UI elements"""
         if hasattr(self, 'GeologyComboBox') and isinstance(
@@ -1104,6 +1122,16 @@ class testDialog(QDialog, FORM_CLASS):
                 self.DTMComboBox, QgsMapLayerComboBox):
             self.DTMComboBox.layerChanged.connect(
                 self.on_DTM_layer_changed)
+
+        if hasattr(self, 'SARSurfaceComboBox') and isinstance(
+                self.SARSurfaceComboBox, QgsMapLayerComboBox):
+            self.SARSurfaceComboBox.layerChanged.connect(
+                self.on_sar_surface_layer_changed)
+
+        if hasattr(self, 'SAROrientationComboBox') and isinstance(
+                self.SAROrientationComboBox, QgsMapLayerComboBox):
+            self.SAROrientationComboBox.layerChanged.connect(
+                self.on_sar_orientation_layer_changed)
 
         if hasattr(self, 'button_box'):
             self.button_box.accepted.connect(self.accept_selection)
@@ -1148,6 +1176,14 @@ class testDialog(QDialog, FORM_CLASS):
         self.selected_DTM_layer = layer
         if layer:
             self.DTM_layer_path = layer.source()
+
+    def on_sar_surface_layer_changed(self, layer):
+        self.selected_sar_surface_layer = layer
+        self.sar_surface_layer_path = layer.source() if layer else None
+
+    def on_sar_orientation_layer_changed(self, layer):
+        self.selected_sar_orientation_layer = layer
+        self.sar_orientation_layer_path = layer.source() if layer else None
 
     def browse_output_folder(self):
         current_folder = self.output_folder.text().strip()
@@ -1420,6 +1456,43 @@ class testDialog(QDialog, FORM_CLASS):
 
         self.update_qgis_progress(5, "Loading geological data...")
 
+        # Merge SAR CSVs with geology CSVs if SAR layers are provided
+        surface_points_path  = self.geology_layer_path
+        orientations_path    = self.orientation_layer_path
+        _tmp_files_to_delete = []
+
+        if self.sar_surface_layer_path or self.sar_orientation_layer_path:
+            import pandas as pd
+            import tempfile
+
+            if self.sar_surface_layer_path:
+                df_geo = pd.read_csv(surface_points_path)
+                df_sar = pd.read_csv(self.sar_surface_layer_path)
+                df_sp  = pd.concat([df_geo, df_sar], ignore_index=True)
+                fd, tmp_sp = tempfile.mkstemp(suffix='_surface_points.csv')
+                os.close(fd)
+                df_sp.to_csv(tmp_sp, index=False)
+                surface_points_path = tmp_sp
+                _tmp_files_to_delete.append(tmp_sp)
+                QgsMessageLog.logMessage(
+                    f"Merged surface points: {len(df_geo)} geology + "
+                    f"{len(df_sar)} SAR = {len(df_sp)} total",
+                    "TestPlugin", Qgis.Info)
+
+            if self.sar_orientation_layer_path:
+                df_geo_o = pd.read_csv(orientations_path)
+                df_sar_o = pd.read_csv(self.sar_orientation_layer_path)
+                df_or    = pd.concat([df_geo_o, df_sar_o], ignore_index=True)
+                fd, tmp_or = tempfile.mkstemp(suffix='_orientations.csv')
+                os.close(fd)
+                df_or.to_csv(tmp_or, index=False)
+                orientations_path = tmp_or
+                _tmp_files_to_delete.append(tmp_or)
+                QgsMessageLog.logMessage(
+                    f"Merged orientations: {len(df_geo_o)} geology + "
+                    f"{len(df_sar_o)} SAR = {len(df_or)} total",
+                    "TestPlugin", Qgis.Info)
+
         # Compute ranges
         x_range = max_x - min_x
         y_range = max_y - min_y
@@ -1451,8 +1524,8 @@ class testDialog(QDialog, FORM_CLASS):
             ],
             resolution=[self.x_value, self.y_value, self.z_value],
             importer_helper=gp.data.ImporterHelper(
-                path_to_orientations=self.orientation_layer_path,
-                path_to_surface_points=self.geology_layer_path,
+                path_to_orientations=orientations_path,
+                path_to_surface_points=surface_points_path,
             )
         )
 
@@ -1630,6 +1703,14 @@ class testDialog(QDialog, FORM_CLASS):
                 f"Traceback: {traceback.format_exc()}",
                 "TestPlugin", Qgis.Critical)
             return None
+
+        finally:
+            # Clean up any temporary merged CSV files
+            for tmp_path in _tmp_files_to_delete:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
 
 # --------- Example usage outside ----------
