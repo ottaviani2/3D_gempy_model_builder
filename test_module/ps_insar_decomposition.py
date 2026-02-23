@@ -921,6 +921,8 @@ class SurfaceEvolutionSolver:
 
 def estimate_thickness_from_area(area_m2):
     """
+    Legacy wrapper — prefer estimate_depth_from_area().
+
     Estimate landslide thickness from area using empirical relationships.
 
     Circular geometry (Simonini et al., 2013):
@@ -952,6 +954,120 @@ def estimate_thickness_from_area(area_m2):
 
 
 # ---------------------------------------------------------------------------
+# Empirical depth-area scaling formulas (D = alpha * A^beta)
+# ---------------------------------------------------------------------------
+
+#: Registry of empirical area-to-depth formulas.
+#: Each entry: alpha, beta coefficients for D = alpha * A^beta (D in metres,
+#: A in square metres), plus metadata for display.
+DEPTH_FORMULAS = {
+    'guzzetti_2009': {
+        'label': 'Guzzetti et al. (2009) — Mixed types, Central Italy',
+        'alpha': 0.1078,
+        'beta': 0.4130,
+        'ref': 'Nat. Hazards Earth Syst. Sci. 9(4), 1085–1098',
+        'desc': (
+            'Derived from 677 mixed landslides (slides, flows, complex) in '
+            'Umbria, central Italy (flysch, marly limestones). Most widely '
+            'cited general-purpose formula. Valid for A ≈ 10¹–10⁷ m².'
+        ),
+    },
+    'larsen_2010_soil': {
+        'label': 'Larsen et al. (2010) — Soil / regolith slides (global)',
+        'alpha': 0.4840,
+        'beta': 0.3290,
+        'ref': 'Nature Geoscience 3, 462–465',
+        'desc': (
+            'Global compilation of ~2,500 soil/regolith landslides across '
+            'diverse climatic and tectonic settings. Best for shallow '
+            'failures in unconsolidated or weathered material (A ≈ 1–10⁹ m²).'
+        ),
+    },
+    'larsen_2010_bedrock': {
+        'label': 'Larsen et al. (2010) — Bedrock slides (global)',
+        'alpha': 0.1570,
+        'beta': 0.4120,
+        'ref': 'Nature Geoscience 3, 462–465',
+        'desc': (
+            'Global compilation of ~1,700 bedrock landslides. Best for rock '
+            'slides and deep-seated failures in hard rock. Bedrock slides '
+            'are deeper than soil slides for a given area (A ≈ 1–10⁹ m²).'
+        ),
+    },
+    'larsen_2010_all': {
+        'label': 'Larsen et al. (2010) — All types combined (global)',
+        'alpha': 0.2840,
+        'beta': 0.3510,
+        'ref': 'Nature Geoscience 3, 462–465',
+        'desc': (
+            'Combined global dataset (~4,231 landslides), all material types. '
+            'Use when landslide type (soil vs. bedrock) is unknown '
+            '(A ≈ 1–10⁹ m²).'
+        ),
+    },
+    'marc_2019': {
+        'label': 'Marc et al. (2019) — Rainfall-triggered (global)',
+        'alpha': 0.1330,
+        'beta': 0.3990,
+        'ref': 'NHESS / EPSL global rainfall-induced inventory',
+        'desc': (
+            'Rainfall-triggered landslides globally across diverse climatic '
+            'and lithological settings. Consistent with Guzzetti (2009) '
+            'exponent; broader geographic coverage (A ≈ 10¹–10⁷ m²).'
+        ),
+    },
+    'tanyas_2017': {
+        'label': 'Tanyas et al. (2017) — Coseismic landslides (global)',
+        'alpha': 0.1370,
+        'beta': 0.4000,
+        'ref': 'JGR Earth Surface 122(8), 1595–1615',
+        'desc': (
+            'Earthquake-triggered landslides globally, compiled from major '
+            'seismic events (Wenchuan 2008, Haiti 2010, etc.). Use for '
+            'seismically induced slope failures (A ≈ 10¹–10⁸ m²).'
+        ),
+    },
+    'guthrie_2004': {
+        'label': 'Guthrie & Evans (2004) — Shallow debris (BC, Canada)',
+        'alpha': 0.0500,
+        'beta': 0.4500,
+        'ref': 'Geomorphology 61(1–2), 141–153',
+        'desc': (
+            'Shallow debris avalanches and flows in steep, forested coastal '
+            'terrain (British Columbia, Canada). Not suitable for deep-seated '
+            'or rotational slides. Valid for A ≈ 10²–10⁵ m².'
+        ),
+    },
+}
+
+
+def estimate_depth_from_area(area_m2, formula_key='guzzetti_2009'):
+    """
+    Estimate landslide sliding surface depth from planimetric area
+    using empirical power-law relationships:  D = alpha * A^beta.
+
+    Parameters
+    ----------
+    area_m2 : float
+        Landslide planimetric area in square metres.
+    formula_key : str
+        Key into DEPTH_FORMULAS. Default: 'guzzetti_2009'.
+
+    Returns
+    -------
+    depth : float
+        Estimated sliding surface depth in metres.
+    info : dict
+        Metadata for the chosen formula (label, alpha, beta, ref, desc).
+    """
+    info = DEPTH_FORMULAS.get(formula_key, DEPTH_FORMULAS['guzzetti_2009'])
+    if area_m2 <= 0:
+        return 0.0, info
+    depth = info['alpha'] * (area_m2 ** info['beta'])
+    return float(depth), info
+
+
+# ---------------------------------------------------------------------------
 # Full pipeline orchestrator
 # ---------------------------------------------------------------------------
 
@@ -967,7 +1083,7 @@ class InSARDecompositionProcessor:
                  slope_azimuth_deg=270.0, slope_angle_deg=50.0,
                  friction_coeff=0.01, grid_nx=100, grid_ny=100,
                  max_distance=100.0, date_col_offset=28,
-                 smoothing_sigma=1.5):
+                 smoothing_sigma=1.5, depth_formula='guzzetti_2009'):
         self.csv_paths = csv_paths
         self.dtm_path = dtm_path
         self.slope_azimuth_deg = slope_azimuth_deg
@@ -978,6 +1094,7 @@ class InSARDecompositionProcessor:
         self.max_distance = max_distance
         self.date_col_offset = date_col_offset
         self.smoothing_sigma = smoothing_sigma
+        self.depth_formula = depth_formula
 
     def load_csv_datasets(self):
         """
@@ -1168,9 +1285,12 @@ class InSARDecompositionProcessor:
             progress_callback=evo_progress,
         )
 
-        # Thickness estimation from area
-        D_est, W_est = estimate_thickness_from_area(
-            np.mean(evo_result['area_series']) if evo_result['area_series'] else 0)
+        # Depth estimation from moving area using selected empirical formula
+        mean_area_m2 = np.mean(evo_result['area_series']) if evo_result['area_series'] else 0
+        depth_est, formula_info = estimate_depth_from_area(mean_area_m2, self.depth_formula)
+
+        # Legacy thickness estimates kept for backward compatibility
+        D_est, W_est = estimate_thickness_from_area(mean_area_m2)
 
         if progress_callback:
             progress_callback(98, "Preparing results...")
@@ -1182,6 +1302,8 @@ class InSARDecompositionProcessor:
             'thickness_evolution': evo_result['thickness_evolution'],
             'area_series': evo_result['area_series'],
             'moving_area_km2': evo_result['moving_area_km2'],
+            'depth_estimate': depth_est,
+            'depth_formula_info': formula_info,
             'thickness_circular': D_est,
             'thickness_unknown_geom': W_est,
             'x': x, 'y': y, 'dx': dx, 'dy': dy,
@@ -1195,7 +1317,7 @@ class InSARDecompositionProcessor:
 
         QgsMessageLog.logMessage(
             f"InSAR decomposition complete: {len(dt_series)} time steps, "
-            f"estimated thickness (circular) = {D_est:.2f} m, "
+            f"depth estimate ({formula_info['label']}) = {depth_est:.2f} m, "
             f"moving area = {evo_result['moving_area_km2']:.3f} km²",
             "TestPlugin", Qgis.Info)
 

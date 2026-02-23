@@ -20,6 +20,7 @@ from qgis.core import (
 from qgis.gui import QgsMapLayerComboBox
 
 from .ps_insar_module import PSInSARProcessor, SurfaceEvolutionProcessor, HAS_TORCH, HAS_PANDAS
+from .ps_insar_decomposition import DEPTH_FORMULAS
 
 
 class PSInSARDialog(QDialog):
@@ -28,7 +29,7 @@ class PSInSARDialog(QDialog):
     def __init__(self, output_folder=None, dtm_layer=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("PS-InSAR Analysis")
-        self.resize(500, 780)
+        self.resize(540, 920)
         self.setWindowModality(Qt.ApplicationModal)
 
         self.output_folder = output_folder or ""
@@ -233,6 +234,34 @@ class PSInSARDialog(QDialog):
 
         root.addWidget(grp_evolution)
 
+        # --- Depth Estimation Formula ---
+        grp_depth = QGroupBox("Sliding Surface Depth Estimation")
+        lay_depth = QVBoxLayout()
+        grp_depth.setLayout(lay_depth)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Formula:"))
+        self.cmbDepthFormula = QComboBox()
+        for key, info in DEPTH_FORMULAS.items():
+            self.cmbDepthFormula.addItem(info['label'], userData=key)
+        row.addWidget(self.cmbDepthFormula)
+        lay_depth.addLayout(row)
+
+        self.lblFormulaDesc = QLabel()
+        self.lblFormulaDesc.setWordWrap(True)
+        self.lblFormulaDesc.setStyleSheet("color: #555555; font-style: italic;")
+        lay_depth.addWidget(self.lblFormulaDesc)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Reference:"))
+        self.lblFormulaRef = QLabel()
+        self.lblFormulaRef.setStyleSheet("font-weight: bold;")
+        row.addWidget(self.lblFormulaRef)
+        row.addStretch()
+        lay_depth.addLayout(row)
+
+        root.addWidget(grp_depth)
+
         # --- Output ---
         grp_output = QGroupBox("Output")
         lay_output = QVBoxLayout()
@@ -279,13 +308,24 @@ class PSInSARDialog(QDialog):
         self.btnRemoveCSV.clicked.connect(self._remove_csv_file)
         self.btnRunEvolution.clicked.connect(self._run_surface_evolution)
         self.chkEnableEvolution.toggled.connect(self._on_evolution_toggled)
+        self.cmbDepthFormula.currentIndexChanged.connect(self._on_formula_changed)
         self._csv_paths = []
 
         # Set initial state of evolution controls (disabled until checkbox is checked)
         self._on_evolution_toggled(False)
 
+        # Populate depth formula description for the default selection
+        self._on_formula_changed(0)
+
         # Populate velocity field for initial layer
         self._on_layer_changed(self.cmbPSLayer.currentLayer())
+
+    def _on_formula_changed(self, index):
+        """Update formula description/reference labels when selection changes."""
+        key = self.cmbDepthFormula.itemData(index)
+        info = DEPTH_FORMULAS.get(key, {})
+        self.lblFormulaDesc.setText(info.get('desc', ''))
+        self.lblFormulaRef.setText(info.get('ref', ''))
 
     def _on_layer_changed(self, layer):
         """Populate velocity field combo when layer changes."""
@@ -495,6 +535,8 @@ class PSInSARDialog(QDialog):
                     self.lblStatus.setText(message)
                 QgsApplication.processEvents()
 
+            depth_formula_key = self.cmbDepthFormula.currentData()
+
             processor = SurfaceEvolutionProcessor(
                 csv_paths=self._csv_paths,
                 dtm_path=dtm_path,
@@ -506,23 +548,35 @@ class PSInSARDialog(QDialog):
                 grid_ny=self.spnGridNY.value(),
                 max_distance=self.spnMaxDist.value(),
                 date_col_offset=self.spnDateOffset.value(),
+                depth_formula=depth_formula_key,
             )
 
             results = processor.run(progress_callback=progress_callback)
 
             self.progressBar.setValue(100)
 
+            formula_info = results.get('depth_formula_info', {})
+            depth_est = results.get('depth_estimate', 0.0)
+            formula_label = formula_info.get('label', depth_formula_key)
+            formula_ref = formula_info.get('ref', '')
+            alpha = formula_info.get('alpha', '?')
+            beta = formula_info.get('beta', '?')
+
             msg = (
                 f"Surface evolution complete:\n"
                 f"  - {results['n_timesteps']} time steps processed\n"
-                f"  - Moving area: {results['moving_area_km2']:.3f} km²\n"
-                f"  - Thickness (circular): {results['thickness_circular']:.2f} m\n"
-                f"  - Thickness (unknown geom): {results['thickness_unknown_geom']:.2f} m\n\n"
+                f"  - Moving area: {results['moving_area_km2']:.3f} km²\n\n"
+                f"Sliding Surface Depth Estimate:\n"
+                f"  - Formula: {formula_label}\n"
+                f"  - Equation: D = {alpha} × A^{beta}\n"
+                f"  - Reference: {formula_ref}\n"
+                f"  - Estimated depth: {depth_est:.2f} m\n\n"
                 f"Output: {evo_output}"
             )
             self.lblStatus.setText(
                 f"Done: {results['n_timesteps']} steps, "
-                f"area={results['moving_area_km2']:.3f} km²")
+                f"area={results['moving_area_km2']:.3f} km², "
+                f"depth={depth_est:.2f} m")
 
             QMessageBox.information(
                 self, "Surface Evolution Complete", msg)

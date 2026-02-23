@@ -10,7 +10,7 @@ import numpy as np
 from scipy.spatial import KDTree, Delaunay
 
 from qgis.core import (
-    QgsProject, QgsVectorLayer, QgsField, QgsFeature,
+    QgsProject, QgsVectorLayer, QgsField, QgsFields, QgsFeature,
     QgsGeometry, QgsPointXY, QgsVectorFileWriter,
     QgsWkbTypes, QgsCoordinateReferenceSystem,
     QgsMessageLog, Qgis, QgsApplication,
@@ -666,13 +666,15 @@ class PSInSARProcessor:
         if crs is None:
             crs = self.ps_layer.crs()
 
-        fields_list = [
+        fields_list = QgsFields()
+        for f in [
             QgsField('X', QVariant.Double),
             QgsField('Y', QVariant.Double),
             QgsField('Z', QVariant.Double),
             QgsField('formation', QVariant.String),
             QgsField('cluster_id', QVariant.Int),
-        ]
+        ]:
+            fields_list.append(f)
 
         transform_context = QgsCoordinateTransformContext()
         save_options = QgsVectorFileWriter.SaveVectorOptions()
@@ -737,7 +739,6 @@ class PSInSARProcessor:
         categories = []
 
         symbol_stable = QgsSymbol.defaultSymbol(QgsWkbTypes.PointGeometry)
-        symbol_stable.setColor(QVariant('#00AA00'))  # noqa - used as color
         try:
             from qgis.PyQt.QtGui import QColor
             symbol_stable.setColor(QColor(0, 170, 0))
@@ -780,7 +781,8 @@ class SurfaceEvolutionProcessor:
                  slope_azimuth_deg=270.0, slope_angle_deg=50.0,
                  friction_coeff=0.01, grid_nx=100, grid_ny=100,
                  max_distance=100.0, date_col_offset=28,
-                 smoothing_sigma=1.5, crs=None):
+                 smoothing_sigma=1.5, depth_formula='guzzetti_2009',
+                 crs=None):
         self.csv_paths = csv_paths
         self.dtm_path = dtm_path
         self.output_path = output_path
@@ -792,6 +794,7 @@ class SurfaceEvolutionProcessor:
         self.max_distance = max_distance
         self.date_col_offset = date_col_offset
         self.smoothing_sigma = smoothing_sigma
+        self.depth_formula = depth_formula
         self.crs = crs
 
     def run(self, progress_callback=None):
@@ -820,6 +823,7 @@ class SurfaceEvolutionProcessor:
             max_distance=self.max_distance,
             date_col_offset=self.date_col_offset,
             smoothing_sigma=self.smoothing_sigma,
+            depth_formula=self.depth_formula,
         )
 
         results = processor.run(progress_callback=progress_callback)
