@@ -19,7 +19,10 @@ from qgis.core import (
 )
 from qgis.gui import QgsMapLayerComboBox
 
-from .ps_insar_module import PSInSARProcessor, SurfaceEvolutionProcessor, HAS_TORCH, HAS_PANDAS
+from .ps_insar_module import (
+    PSInSARProcessor, SurfaceEvolutionProcessor,
+    GempyExporter, HAS_TORCH, HAS_PANDAS,
+)
 from .ps_insar_decomposition import DEPTH_FORMULAS
 
 
@@ -283,6 +286,14 @@ class PSInSARDialog(QDialog):
         self.chkAddToQGIS.setChecked(True)
         lay_output.addWidget(self.chkAddToQGIS)
 
+        self.btnExportGemPy = QPushButton("Export to GemPy CSV...")
+        self.btnExportGemPy.setMinimumHeight(28)
+        self.btnExportGemPy.setToolTip(
+            "Export boundary points and sliding surface to GemPy-compatible CSV files.\n"
+            "Run analysis first.")
+        self.btnExportGemPy.setEnabled(False)
+        lay_output.addWidget(self.btnExportGemPy)
+
         root.addWidget(grp_output)
 
         # --- Run / Progress ---
@@ -309,7 +320,9 @@ class PSInSARDialog(QDialog):
         self.btnRunEvolution.clicked.connect(self._run_surface_evolution)
         self.chkEnableEvolution.toggled.connect(self._on_evolution_toggled)
         self.cmbDepthFormula.currentIndexChanged.connect(self._on_formula_changed)
+        self.btnExportGemPy.clicked.connect(self._export_gempy)
         self._csv_paths = []
+        self._last_boundary_points = None   # populated after successful _run_analysis
 
         # Set initial state of evolution controls (disabled until checkbox is checked)
         self._on_evolution_toggled(False)
@@ -430,6 +443,9 @@ class PSInSARDialog(QDialog):
             boundary_points, labels, xy = processor.run(
                 progress_callback=progress_callback)
 
+            # Store for GemPy export
+            self._last_boundary_points = boundary_points
+
             # Add result layer to QGIS
             if self.chkAddToQGIS.isChecked() and os.path.exists(output_path):
                 result_layer = QgsVectorLayer(
@@ -443,13 +459,17 @@ class PSInSARDialog(QDialog):
                 f"Done: {n_moving} moving points, {n_boundary} boundary points")
             self.progressBar.setValue(100)
 
+            if boundary_points:
+                self.btnExportGemPy.setEnabled(True)
+
             QMessageBox.information(
                 self, "PS-InSAR Analysis Complete",
                 f"Classification complete:\n"
                 f"  - {len(labels)} total points\n"
                 f"  - {n_moving} moving points\n"
                 f"  - {n_boundary} boundary points extracted\n\n"
-                f"Output: {output_path}")
+                f"Output: {output_path}\n\n"
+                f"Use 'Export to GemPy CSV...' to generate GemPy-ready files.")
 
         except Exception as e:
             self.lblStatus.setText(f"Error: {e}")
@@ -592,3 +612,65 @@ class PSInSARDialog(QDialog):
                 self, "Error", f"Surface evolution failed:\n{e}")
         finally:
             self.btnRunEvolution.setEnabled(True)
+
+    # --- GemPy export ---
+
+    def _export_gempy(self):
+        """Export boundary + sliding-surface points to GemPy-compatible CSV files."""
+        if not self._last_boundary_points:
+            QMessageBox.warning(
+                self, "Warning",
+                "No analysis results available. Please run the analysis first.")
+            return
+
+        # Ask the user for the output prefix (folder + base name)
+        default_dir = self.txtOutputPath.text().strip()
+        if default_dir:
+            default_prefix = os.path.splitext(default_dir)[0]
+        else:
+            default_prefix = ""
+
+        prefix, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save GemPy CSV files (enter base name without extension)",
+            default_prefix,
+            "CSV prefix (*)")
+
+        if not prefix:
+            return
+
+        # Strip any extension the user may have typed
+        prefix = os.path.splitext(prefix)[0]
+
+        depth_formula_key = self.cmbDepthFormula.currentData()
+
+        try:
+            exporter = GempyExporter(
+                boundary_points=self._last_boundary_points,
+                depth_formula_key=depth_formula_key,
+            )
+            sp_path, or_path = exporter.export(prefix)
+
+            QMessageBox.information(
+                self, "GemPy Export Complete",
+                f"Two GemPy-compatible CSV files written:\n\n"
+                f"Surface points ({len(self._last_boundary_points) * 2} rows):\n"
+                f"  {sp_path}\n\n"
+                f"Orientations ({len(self._last_boundary_points) * 2} rows):\n"
+                f"  {or_path}\n\n"
+                f"Formations:\n"
+                f"  landslide_boundary_N  — PS-InSAR boundary on topography\n"
+                f"  sliding_surface_N     — estimated sliding surface at depth\n\n"
+                f"Depth formula: {depth_formula_key}")
+
+            self.lblStatus.setText(
+                f"GemPy CSVs exported: {os.path.basename(sp_path)}, "
+                f"{os.path.basename(or_path)}")
+
+        except Exception as e:
+            QgsMessageLog.logMessage(
+                f"GemPy export error: {e}", "TestPlugin", Qgis.Critical)
+            import traceback
+            QgsMessageLog.logMessage(
+                traceback.format_exc(), "TestPlugin", Qgis.Critical)
+            QMessageBox.critical(self, "Export Error", f"GemPy export failed:\n{e}")

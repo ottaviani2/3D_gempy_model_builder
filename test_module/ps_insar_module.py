@@ -6,6 +6,8 @@ classification and geometric boundary extraction.
 """
 
 import os
+import math
+import csv
 import numpy as np
 from scipy.spatial import KDTree, Delaunay
 
@@ -945,3 +947,167 @@ class SurfaceEvolutionProcessor:
         QgsProject.instance().addMapLayer(mem_layer)
         QgsMessageLog.logMessage(
             "Added surface evolution layer to QGIS", "TestPlugin", Qgis.Info)
+
+
+# ---------------------------------------------------------------------------
+# GemPy CSV Exporter
+# ---------------------------------------------------------------------------
+
+class GempyExporter:
+    """
+    Export PS-InSAR boundary points and computed sliding surface points
+    to GemPy-compatible CSV files.
+
+    Two files are written:
+      {prefix}_surface_points.csv  — columns: X,Y,Z,formation
+      {prefix}_orientations.csv    — columns: X,Y,Z,formation,azimuth,dip,polarity
+
+    For each cluster the algorithm:
+      1. Computes the centroid (cx, cy) and the elevation range (z_min … z_max).
+      2. Estimates the sliding-surface depth D from the cluster's convex-hull area
+         using the chosen empirical formula.
+      3. For every boundary point (x, y, z):
+           - azimuth = atan2(cx-x, cy-y) in degrees [0-360, clockwise from North]
+             → always faces INWARD (toward centroid)
+           - dip     = t * 90°  where  t = (z - z_min) / z_range  clamped [0,1]
+             → ≈0° at the toe (low elevation), ≈90° at the head scarp (high elevation)
+           - sliding surface point projected D metres inward + downward:
+               x_deep = x + D·sin(dip)·sin(az)
+               y_deep = y + D·sin(dip)·cos(az)
+               z_deep = z - D·cos(dip)
+    """
+
+    FORMATION_SURFACE = "landslide_boundary"
+    FORMATION_DEEP    = "sliding_surface"
+
+    def __init__(self, boundary_points, depth_formula_key='guzzetti_2009'):
+        """
+        Parameters
+        ----------
+        boundary_points : list of dict
+            Each dict must contain keys: x, y, z, cluster_id.
+        depth_formula_key : str
+            Key in DEPTH_FORMULAS (ps_insar_decomposition).
+        """
+        self.boundary_points   = boundary_points
+        self.depth_formula_key = depth_formula_key
+
+    # ------------------------------------------------------------------
+    def export(self, output_prefix):
+        """
+        Write the two CSVs and return (surface_points_path, orientations_path).
+        """
+        from .ps_insar_decomposition import estimate_depth_from_area
+
+        if not self.boundary_points:
+            raise ValueError("No boundary points to export.")
+
+        # Group points by cluster
+        clusters = {}
+        for pt in self.boundary_points:
+            clusters.setdefault(pt['cluster_id'], []).append(pt)
+
+        surface_rows     = []   # X, Y, Z, formation
+        orientation_rows = []   # X, Y, Z, formation, azimuth, dip, polarity
+
+        for cid, pts in clusters.items():
+            xs = [p['x'] for p in pts]
+            ys = [p['y'] for p in pts]
+            zs = [p['z'] for p in pts]
+
+            cx = sum(xs) / len(xs)
+            cy = sum(ys) / len(ys)
+            z_min   = min(zs)
+            z_max   = max(zs)
+            z_range = (z_max - z_min) if z_max != z_min else 1.0
+
+            area_m2 = self._convex_hull_area(xs, ys)
+            depth, _formula_info = estimate_depth_from_area(
+                area_m2, self.depth_formula_key)
+
+            f_surface = f"{self.FORMATION_SURFACE}_{cid}"
+            f_deep    = f"{self.FORMATION_DEEP}_{cid}"
+
+            for pt in pts:
+                x, y, z = pt['x'], pt['y'], pt['z']
+
+                # --- inward azimuth (clockwise from North) ---
+                dx, dy = cx - x, cy - y
+                if dx == 0.0 and dy == 0.0:
+                    az_deg = 0.0
+                else:
+                    az_deg = math.degrees(math.atan2(dx, dy)) % 360.0
+
+                # --- dip: 0° at toe, 90° at head scarp ---
+                t       = max(0.0, min(1.0, (z - z_min) / z_range))
+                dip_deg = t * 90.0
+
+                # surface boundary point
+                surface_rows.append(
+                    {'X': x, 'Y': y, 'Z': z, 'formation': f_surface})
+
+                # orientation at boundary point
+                orientation_rows.append({
+                    'X': x, 'Y': y, 'Z': z,
+                    'formation': f_surface,
+                    'azimuth': az_deg, 'dip': dip_deg, 'polarity': 1,
+                })
+
+                # sliding-surface point
+                az_rad  = math.radians(az_deg)
+                dip_rad = math.radians(dip_deg)
+                x_deep  = x + depth * math.sin(dip_rad) * math.sin(az_rad)
+                y_deep  = y + depth * math.sin(dip_rad) * math.cos(az_rad)
+                z_deep  = z - depth * math.cos(dip_rad)
+
+                surface_rows.append(
+                    {'X': x_deep, 'Y': y_deep, 'Z': z_deep,
+                     'formation': f_deep})
+
+                # orientation at deep point (same attitude as at surface boundary)
+                orientation_rows.append({
+                    'X': x_deep, 'Y': y_deep, 'Z': z_deep,
+                    'formation': f_deep,
+                    'azimuth': az_deg, 'dip': dip_deg, 'polarity': 1,
+                })
+
+        sp_path = output_prefix + '_surface_points.csv'
+        or_path = output_prefix + '_orientations.csv'
+
+        self._write_csv(sp_path, surface_rows,
+                        ['X', 'Y', 'Z', 'formation'])
+        self._write_csv(or_path, orientation_rows,
+                        ['X', 'Y', 'Z', 'formation', 'azimuth', 'dip', 'polarity'])
+
+        QgsMessageLog.logMessage(
+            f"GemPy surface points: {sp_path} ({len(surface_rows)} rows)\n"
+            f"GemPy orientations:   {or_path} ({len(orientation_rows)} rows)",
+            "TestPlugin", Qgis.Info)
+
+        return sp_path, or_path
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _convex_hull_area(xs, ys):
+        """Return the 2-D convex-hull area (m²) for the given point set."""
+        if len(xs) < 3:
+            return 0.0
+        try:
+            from scipy.spatial import ConvexHull
+            hull = ConvexHull(np.column_stack([xs, ys]))
+            return float(hull.volume)   # hull.volume == area in 2-D
+        except Exception:
+            # Fallback: half the bounding-box area
+            return (max(xs) - min(xs)) * (max(ys) - min(ys)) * 0.5
+
+    @staticmethod
+    def _write_csv(path, rows, fieldnames):
+        """Write a list of dicts to a CSV file with the given column order."""
+        with open(path, 'w', newline='', encoding='utf-8') as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({
+                    k: (round(v, 4) if isinstance(v, float) else v)
+                    for k, v in row.items()
+                })
