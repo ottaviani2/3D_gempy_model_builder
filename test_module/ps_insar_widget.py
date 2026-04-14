@@ -7,8 +7,8 @@ Standalone dialog for PS-InSAR moving area detection and boundary extraction.
 import os
 
 from qgis.PyQt.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QComboBox, QDoubleSpinBox, QSpinBox, QCheckBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
+    QComboBox, QDoubleSpinBox, QSpinBox, QCheckBox, QRadioButton,
     QPushButton, QLineEdit, QFileDialog, QProgressBar,
     QMessageBox,
 )
@@ -22,6 +22,7 @@ from qgis.gui import QgsMapLayerComboBox
 from .ps_insar_module import (
     PSInSARProcessor, SurfaceEvolutionProcessor,
     GempyExporter, HAS_TORCH, HAS_PANDAS,
+    LOSDecompositionProcessor,
 )
 from .ps_insar_decomposition import DEPTH_FORMULAS
 
@@ -32,7 +33,7 @@ class PSInSARDialog(QDialog):
     def __init__(self, output_folder=None, dtm_layer=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("PS-InSAR Analysis")
-        self.resize(540, 920)
+        self.resize(800, 620)
         self.setWindowModality(Qt.ApplicationModal)
 
         self.output_folder = output_folder or ""
@@ -45,115 +46,108 @@ class PSInSARDialog(QDialog):
         root = QVBoxLayout()
         self.setLayout(root)
 
-        # --- PS Data section ---
+        # --- PS Data (2 controls per row) ---
         grp_data = QGroupBox("PS Data")
-        lay_data = QVBoxLayout()
+        lay_data = QGridLayout()
+        lay_data.setColumnStretch(1, 1)
+        lay_data.setColumnStretch(3, 1)
         grp_data.setLayout(lay_data)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("PS Layer:"))
+        lay_data.addWidget(QLabel("PS Layer:"), 0, 0)
         self.cmbPSLayer = QgsMapLayerComboBox()
         self.cmbPSLayer.setFilters(QgsMapLayerProxyModel.VectorLayer)
-        row.addWidget(self.cmbPSLayer)
-        lay_data.addLayout(row)
+        lay_data.addWidget(self.cmbPSLayer, 0, 1)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Velocity field:"))
+        lay_data.addWidget(QLabel("Velocity field:"), 0, 2)
         self.cmbVelocityField = QComboBox()
-        row.addWidget(self.cmbVelocityField)
-        lay_data.addLayout(row)
+        lay_data.addWidget(self.cmbVelocityField, 0, 3)
 
         root.addWidget(grp_data)
 
-        # --- Classification Parameters ---
+        # --- Classification Parameters (2 controls per row) ---
         grp_class = QGroupBox("Classification Parameters")
-        lay_class = QVBoxLayout()
+        lay_class = QGridLayout()
+        lay_class.setColumnStretch(1, 1)
+        lay_class.setColumnStretch(3, 1)
         grp_class.setLayout(lay_class)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Velocity threshold (mm/yr):"))
+        lay_class.addWidget(QLabel("Velocity threshold:"), 0, 0)
         self.spnThreshold = QDoubleSpinBox()
         self.spnThreshold.setRange(0.1, 100.0)
         self.spnThreshold.setValue(2.0)
         self.spnThreshold.setSingleStep(0.5)
-        row.addWidget(self.spnThreshold)
-        lay_class.addLayout(row)
+        self.spnThreshold.setToolTip(
+            "Threshold applied to the velocity field selected for classification.\n"
+            "Must be in the same units as the velocity field (typically mm/yr for\n"
+            "EGMS/PS-InSAR data).  Points whose |velocity| exceeds this value are\n"
+            "initially labelled as 'moving'.")
+        lay_class.addWidget(self.spnThreshold, 0, 1)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("K neighbors:"))
+        lay_class.addWidget(QLabel("K neighbors:"), 0, 2)
         self.spnKNeighbors = QSpinBox()
         self.spnKNeighbors.setRange(3, 100)
         self.spnKNeighbors.setValue(20)
-        row.addWidget(self.spnKNeighbors)
-        lay_class.addLayout(row)
+        lay_class.addWidget(self.spnKNeighbors, 0, 3)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Epochs:"))
+        lay_class.addWidget(QLabel("Epochs:"), 1, 0)
         self.spnEpochs = QSpinBox()
         self.spnEpochs.setRange(5, 500)
         self.spnEpochs.setValue(50)
-        row.addWidget(self.spnEpochs)
-        lay_class.addLayout(row)
+        lay_class.addWidget(self.spnEpochs, 1, 1)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Refinement iterations:"))
+        lay_class.addWidget(QLabel("Refinement iterations:"), 1, 2)
         self.spnRefinement = QSpinBox()
         self.spnRefinement.setRange(0, 10)
         self.spnRefinement.setValue(1)
-        row.addWidget(self.spnRefinement)
-        lay_class.addLayout(row)
+        lay_class.addWidget(self.spnRefinement, 1, 3)
 
         self.chkUseNN = QCheckBox("Use NN spatial smoothing (requires PyTorch)")
         self.chkUseNN.setChecked(HAS_TORCH)
         if not HAS_TORCH:
             self.chkUseNN.setEnabled(False)
             self.chkUseNN.setToolTip("PyTorch is not installed. Using threshold fallback.")
-        lay_class.addWidget(self.chkUseNN)
+        lay_class.addWidget(self.chkUseNN, 2, 0, 1, 4)
 
         root.addWidget(grp_class)
 
-        # --- Boundary Extraction ---
+        # --- Boundary Extraction (2 controls per row) ---
         grp_boundary = QGroupBox("Boundary Extraction")
-        lay_boundary = QVBoxLayout()
+        lay_boundary = QGridLayout()
+        lay_boundary.setColumnStretch(1, 1)
+        lay_boundary.setColumnStretch(3, 1)
         grp_boundary.setLayout(lay_boundary)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Min cluster size:"))
+        lay_boundary.addWidget(QLabel("Min cluster size:"), 0, 0)
         self.spnMinCluster = QSpinBox()
         self.spnMinCluster.setRange(3, 1000)
         self.spnMinCluster.setValue(10)
-        row.addWidget(self.spnMinCluster)
-        lay_boundary.addLayout(row)
+        lay_boundary.addWidget(self.spnMinCluster, 0, 1)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Alpha (0=auto):"))
+        lay_boundary.addWidget(QLabel("Alpha (0=auto):"), 0, 2)
         self.spnAlpha = QDoubleSpinBox()
         self.spnAlpha.setRange(0.0, 100000.0)
         self.spnAlpha.setValue(0.0)
         self.spnAlpha.setSingleStep(10.0)
-        row.addWidget(self.spnAlpha)
-        lay_boundary.addLayout(row)
+        lay_boundary.addWidget(self.spnAlpha, 0, 3)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Z source:"))
+        lay_boundary.addWidget(QLabel("Z source:"), 1, 0)
         self.cmbZSource = QComboBox()
         self.cmbZSource.addItems(["Constant", "From DTM", "From PS data"])
-        row.addWidget(self.cmbZSource)
-        lay_boundary.addLayout(row)
+        lay_boundary.addWidget(self.cmbZSource, 1, 1)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Z constant value:"))
+        lay_boundary.addWidget(QLabel("Z constant value:"), 1, 2)
         self.spnZConstant = QDoubleSpinBox()
         self.spnZConstant.setRange(-10000.0, 100000.0)
         self.spnZConstant.setValue(0.0)
-        row.addWidget(self.spnZConstant)
-        lay_boundary.addLayout(row)
+        lay_boundary.addWidget(self.spnZConstant, 1, 3)
 
         root.addWidget(grp_boundary)
 
-        # --- Surface Evolution (LOS Decomposition) ---
+        # --- Surface Evolution (2 controls per row) ---
         grp_evolution = QGroupBox("Surface Evolution (Multi-orbit Decomposition)")
-        lay_evo = QVBoxLayout()
+        lay_evo = QGridLayout()
+        lay_evo.setColumnStretch(1, 1)
+        lay_evo.setColumnStretch(3, 1)
         grp_evolution.setLayout(lay_evo)
 
         self.chkEnableEvolution = QCheckBox("Enable surface evolution analysis")
@@ -161,130 +155,115 @@ class PSInSARDialog(QDialog):
         if not HAS_PANDAS:
             self.chkEnableEvolution.setEnabled(False)
             self.chkEnableEvolution.setToolTip("pandas is required for CSV processing")
-        lay_evo.addWidget(self.chkEnableEvolution)
+        lay_evo.addWidget(self.chkEnableEvolution, 0, 0, 1, 4)
 
-        # CSV file list
-        row = QHBoxLayout()
-        row.addWidget(QLabel("InSAR CSV files:"))
+        lay_evo.addWidget(QLabel("InSAR CSV files:"), 1, 0)
         self.lstCSVFiles = QComboBox()
         self.lstCSVFiles.setEditable(False)
         self.lstCSVFiles.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLength)
-        row.addWidget(self.lstCSVFiles)
+        lay_evo.addWidget(self.lstCSVFiles, 1, 1)
         self.btnAddCSV = QPushButton("+")
         self.btnAddCSV.setFixedWidth(30)
         self.btnAddCSV.setToolTip("Add InSAR CSV file (need >= 2 orbits)")
-        row.addWidget(self.btnAddCSV)
+        lay_evo.addWidget(self.btnAddCSV, 1, 2)
         self.btnRemoveCSV = QPushButton("-")
         self.btnRemoveCSV.setFixedWidth(30)
         self.btnRemoveCSV.setToolTip("Remove selected CSV file")
-        row.addWidget(self.btnRemoveCSV)
-        lay_evo.addLayout(row)
+        lay_evo.addWidget(self.btnRemoveCSV, 1, 3)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Slope azimuth (deg):"))
+        lay_evo.addWidget(QLabel("Slope azimuth (deg):"), 2, 0)
         self.spnSlopeAzimuth = QDoubleSpinBox()
         self.spnSlopeAzimuth.setRange(0.0, 360.0)
         self.spnSlopeAzimuth.setValue(270.0)
-        row.addWidget(self.spnSlopeAzimuth)
-        row.addWidget(QLabel("Slope angle (deg):"))
+        lay_evo.addWidget(self.spnSlopeAzimuth, 2, 1)
+        lay_evo.addWidget(QLabel("Slope angle (deg):"), 2, 2)
         self.spnSlopeAngle = QDoubleSpinBox()
         self.spnSlopeAngle.setRange(0.0, 90.0)
         self.spnSlopeAngle.setValue(50.0)
-        row.addWidget(self.spnSlopeAngle)
-        lay_evo.addLayout(row)
+        lay_evo.addWidget(self.spnSlopeAngle, 2, 3)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Friction coeff f:"))
+        lay_evo.addWidget(QLabel("Friction coeff f:"), 3, 0)
         self.spnFriction = QDoubleSpinBox()
         self.spnFriction.setRange(0.001, 1.0)
         self.spnFriction.setValue(0.01)
         self.spnFriction.setSingleStep(0.01)
         self.spnFriction.setDecimals(3)
-        row.addWidget(self.spnFriction)
-        row.addWidget(QLabel("Max distance (m):"))
+        lay_evo.addWidget(self.spnFriction, 3, 1)
+        lay_evo.addWidget(QLabel("Max distance (m):"), 3, 2)
         self.spnMaxDist = QDoubleSpinBox()
         self.spnMaxDist.setRange(1.0, 10000.0)
         self.spnMaxDist.setValue(100.0)
-        row.addWidget(self.spnMaxDist)
-        lay_evo.addLayout(row)
+        lay_evo.addWidget(self.spnMaxDist, 3, 3)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Grid NX:"))
+        lay_evo.addWidget(QLabel("Grid NX:"), 4, 0)
         self.spnGridNX = QSpinBox()
         self.spnGridNX.setRange(10, 1000)
         self.spnGridNX.setValue(100)
-        row.addWidget(self.spnGridNX)
-        row.addWidget(QLabel("Grid NY:"))
+        lay_evo.addWidget(self.spnGridNX, 4, 1)
+        lay_evo.addWidget(QLabel("Grid NY:"), 4, 2)
         self.spnGridNY = QSpinBox()
         self.spnGridNY.setRange(10, 1000)
         self.spnGridNY.setValue(100)
-        row.addWidget(self.spnGridNY)
-        lay_evo.addLayout(row)
+        lay_evo.addWidget(self.spnGridNY, 4, 3)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Date column offset:"))
+        lay_evo.addWidget(QLabel("Date column offset:"), 5, 0)
         self.spnDateOffset = QSpinBox()
         self.spnDateOffset.setRange(1, 200)
         self.spnDateOffset.setValue(28)
         self.spnDateOffset.setToolTip(
             "Column index where time-series displacement data starts in the CSV")
-        row.addWidget(self.spnDateOffset)
-        lay_evo.addLayout(row)
+        lay_evo.addWidget(self.spnDateOffset, 5, 1)
 
         self.btnRunEvolution = QPushButton("Run Surface Evolution")
         self.btnRunEvolution.setMinimumHeight(28)
-        lay_evo.addWidget(self.btnRunEvolution)
+        lay_evo.addWidget(self.btnRunEvolution, 5, 2, 1, 2)
 
         root.addWidget(grp_evolution)
 
-        # --- Depth Estimation Formula ---
+        # --- Depth Estimation Formula (formula + ref on one row) ---
         grp_depth = QGroupBox("Sliding Surface Depth Estimation")
-        lay_depth = QVBoxLayout()
+        lay_depth = QGridLayout()
+        lay_depth.setColumnStretch(1, 1)
+        lay_depth.setColumnStretch(3, 1)
         grp_depth.setLayout(lay_depth)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Formula:"))
+        lay_depth.addWidget(QLabel("Formula:"), 0, 0)
         self.cmbDepthFormula = QComboBox()
         for key, info in DEPTH_FORMULAS.items():
             self.cmbDepthFormula.addItem(info['label'], userData=key)
-        row.addWidget(self.cmbDepthFormula)
-        lay_depth.addLayout(row)
+        lay_depth.addWidget(self.cmbDepthFormula, 0, 1)
+
+        lay_depth.addWidget(QLabel("Reference:"), 0, 2)
+        self.lblFormulaRef = QLabel()
+        self.lblFormulaRef.setStyleSheet("font-weight: bold;")
+        lay_depth.addWidget(self.lblFormulaRef, 0, 3)
 
         self.lblFormulaDesc = QLabel()
         self.lblFormulaDesc.setWordWrap(True)
         self.lblFormulaDesc.setStyleSheet("color: #555555; font-style: italic;")
-        lay_depth.addWidget(self.lblFormulaDesc)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Reference:"))
-        self.lblFormulaRef = QLabel()
-        self.lblFormulaRef.setStyleSheet("font-weight: bold;")
-        row.addWidget(self.lblFormulaRef)
-        row.addStretch()
-        lay_depth.addLayout(row)
+        lay_depth.addWidget(self.lblFormulaDesc, 1, 0, 1, 4)
 
         root.addWidget(grp_depth)
 
         # --- Output ---
         grp_output = QGroupBox("Output")
-        lay_output = QVBoxLayout()
+        lay_output = QGridLayout()
+        lay_output.setColumnStretch(1, 1)
         grp_output.setLayout(lay_output)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Output shapefile:"))
+        lay_output.addWidget(QLabel("Output shapefile:"), 0, 0)
         self.txtOutputPath = QLineEdit()
         if self.output_folder:
             self.txtOutputPath.setText(
                 os.path.join(self.output_folder, "ps_moving_boundary.shp"))
-        row.addWidget(self.txtOutputPath)
+        lay_output.addWidget(self.txtOutputPath, 0, 1)
         self.btnBrowseOutput = QPushButton("...")
         self.btnBrowseOutput.setFixedWidth(30)
-        row.addWidget(self.btnBrowseOutput)
-        lay_output.addLayout(row)
+        lay_output.addWidget(self.btnBrowseOutput, 0, 2)
 
         self.chkAddToQGIS = QCheckBox("Add result to QGIS layers")
         self.chkAddToQGIS.setChecked(True)
-        lay_output.addWidget(self.chkAddToQGIS)
+        lay_output.addWidget(self.chkAddToQGIS, 1, 0, 1, 2)
 
         self.btnExportGemPy = QPushButton("Export to GemPy CSV...")
         self.btnExportGemPy.setMinimumHeight(28)
@@ -292,21 +271,22 @@ class PSInSARDialog(QDialog):
             "Export boundary points and sliding surface to GemPy-compatible CSV files.\n"
             "Run analysis first.")
         self.btnExportGemPy.setEnabled(False)
-        lay_output.addWidget(self.btnExportGemPy)
+        lay_output.addWidget(self.btnExportGemPy, 1, 2)
 
         root.addWidget(grp_output)
 
         # --- Run / Progress ---
+        run_row = QHBoxLayout()
         self.btnRun = QPushButton("Run")
         self.btnRun.setMinimumHeight(30)
-        root.addWidget(self.btnRun)
+        run_row.addWidget(self.btnRun)
+        self.lblStatus = QLabel("Ready")
+        run_row.addWidget(self.lblStatus)
+        root.addLayout(run_row)
 
         self.progressBar = QProgressBar()
         self.progressBar.setValue(0)
         root.addWidget(self.progressBar)
-
-        self.lblStatus = QLabel("Ready")
-        root.addWidget(self.lblStatus)
 
     def _connect_signals(self):
         self.cmbPSLayer.layerChanged.connect(self._on_layer_changed)
@@ -674,3 +654,474 @@ class PSInSARDialog(QDialog):
             QgsMessageLog.logMessage(
                 traceback.format_exc(), "TestPlugin", Qgis.Critical)
             QMessageBox.critical(self, "Export Error", f"GemPy export failed:\n{e}")
+
+
+# ---------------------------------------------------------------------------
+# Helper: single-geometry input panel
+# ---------------------------------------------------------------------------
+
+_DEFAULT_INC = [38.0, 38.0, 38.0]
+_DEFAULT_HDG = [350.0, 190.0, 350.0]  # asc, desc, third (asc second track)
+
+
+class _GeometryPanel(QGroupBox):
+    """
+    Compact input panel for one InSAR geometry (satellite pass).
+    Contains layer selector, LOS velocity field, incidence angle
+    and satellite heading (each can be read from a field or given as a constant).
+    """
+
+    def __init__(self, number, parent=None):
+        super().__init__(f"Geometry {number}", parent)
+        self._number = number
+        self._build_ui()
+        self._connect()
+
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        grid = QGridLayout()
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        self.setLayout(grid)
+
+        # --- Row 0: PS layer ---
+        grid.addWidget(QLabel("PS layer:"), 0, 0)
+        self.cmbLayer = QgsMapLayerComboBox()
+        self.cmbLayer.setFilters(QgsMapLayerProxyModel.PointLayer)
+        self.cmbLayer.setAllowEmptyLayer(True)
+        self.cmbLayer.setCurrentIndex(0)
+        grid.addWidget(self.cmbLayer, 0, 1, 1, 3)
+
+        # --- Row 1: LOS velocity field ---
+        grid.addWidget(QLabel("LOS velocity:"), 1, 0)
+        self.cmbVelField = QComboBox()
+        grid.addWidget(self.cmbVelField, 1, 1, 1, 3)
+
+        # --- Row 2: Incidence angle ---
+        grid.addWidget(QLabel("Incidence (°):"), 2, 0)
+        self.chkIncField = QCheckBox("From field:")
+        self.cmbIncField = QComboBox()
+        self.cmbIncField.setEnabled(False)
+        self.spnIncConst = QDoubleSpinBox()
+        self.spnIncConst.setRange(0.0, 90.0)
+        self.spnIncConst.setValue(_DEFAULT_INC[self._number - 1])
+        self.spnIncConst.setDecimals(1)
+        self.spnIncConst.setSuffix(" °")
+        self.spnIncConst.setToolTip("Incidence angle from vertical (nadir).")
+        grid.addWidget(self.chkIncField, 2, 1)
+        grid.addWidget(self.cmbIncField, 2, 2)
+        grid.addWidget(self.spnIncConst, 2, 3)
+
+        # --- Row 3: Satellite heading ---
+        grid.addWidget(QLabel("Sat. heading (°):"), 3, 0)
+        self.chkHdgField = QCheckBox("From field:")
+        self.cmbHdgField = QComboBox()
+        self.cmbHdgField.setEnabled(False)
+        self.spnHdgConst = QDoubleSpinBox()
+        self.spnHdgConst.setRange(-180.0, 360.0)
+        self.spnHdgConst.setValue(_DEFAULT_HDG[self._number - 1])
+        self.spnHdgConst.setDecimals(1)
+        self.spnHdgConst.setSuffix(" °")
+        self.spnHdgConst.setToolTip(
+            "Satellite flight azimuth clockwise from North.\n"
+            "Ascending Sentinel-1 ≈ 350°,  Descending ≈ 190°.")
+        grid.addWidget(self.chkHdgField, 3, 1)
+        grid.addWidget(self.cmbHdgField, 3, 2)
+        grid.addWidget(self.spnHdgConst, 3, 3)
+
+    def _connect(self):
+        self.cmbLayer.layerChanged.connect(self._on_layer_changed)
+        self.chkIncField.toggled.connect(self.cmbIncField.setEnabled)
+        self.chkIncField.toggled.connect(
+            lambda checked: self.spnIncConst.setEnabled(not checked))
+        self.chkHdgField.toggled.connect(self.cmbHdgField.setEnabled)
+        self.chkHdgField.toggled.connect(
+            lambda checked: self.spnHdgConst.setEnabled(not checked))
+        self._on_layer_changed(self.cmbLayer.currentLayer())
+
+    def _on_layer_changed(self, layer):
+        for cmb in (self.cmbVelField, self.cmbIncField, self.cmbHdgField):
+            cmb.clear()
+        if layer is None or not hasattr(layer, 'fields'):
+            return
+        for f in layer.fields():
+            tn = f.typeName().lower()
+            is_numeric = (
+                any(t in tn for t in ['int', 'real', 'double',
+                                       'float', 'numeric', 'decimal'])
+                or f.type() in (2, 6))  # QVariant.Int, QVariant.Double
+            if is_numeric:
+                for cmb in (self.cmbVelField, self.cmbIncField,
+                            self.cmbHdgField):
+                    cmb.addItem(f.name())
+        # Auto-select a velocity-like field
+        for i in range(self.cmbVelField.count()):
+            n = self.cmbVelField.itemText(i).lower()
+            if any(kw in n for kw in
+                   ['vel', 'los', 'v_', 'disp', 'mm', 'rate', 'defo']):
+                self.cmbVelField.setCurrentIndex(i)
+                break
+
+    # ------------------------------------------------------------------
+    def get_config(self):
+        """Return a dict suitable for LOSDecompositionProcessor."""
+        layer = self.cmbLayer.currentLayer()
+        if layer is None:
+            return None
+        return {
+            'layer':     layer,
+            'vel_field': self.cmbVelField.currentText(),
+            'inc_field': (self.cmbIncField.currentText()
+                          if self.chkIncField.isChecked() else None),
+            'inc_const': self.spnIncConst.value(),
+            'hdg_field': (self.cmbHdgField.currentText()
+                          if self.chkHdgField.isChecked() else None),
+            'hdg_const': self.spnHdgConst.value(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Main 3-geometry LOS decomposition dialog
+# ---------------------------------------------------------------------------
+
+class LOSDecompositionDialog(QDialog):
+    """
+    Dialog for 3-geometry InSAR LOS decomposition.
+
+    Accepts three PS-InSAR point layers (one per satellite geometry) and
+    decomposes their Line-of-Sight velocities into:
+      • East-West  displacement rate  (dE)
+      • Up-Down    displacement rate  (dU)
+      • North-South displacement rate (dN)  — optional
+
+    The decomposition uses the right-looking SAR look-vector convention:
+        look_azimuth = satellite_heading + 90°
+        eE = sin(θ) · sin(look_az)
+        eN = sin(θ) · cos(look_az)
+        eU = cos(θ)
+    where θ is the incidence angle from vertical.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("InSAR 3-Geometry Decomposition  —  E/W · U/D")
+        self.resize(720, 900)
+        self.setWindowModality(Qt.ApplicationModal)
+        self._build_ui()
+        self._connect_signals()
+
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        root = QVBoxLayout()
+        self.setLayout(root)
+
+        # Three geometry panels
+        self._panels = []
+        for n in range(1, 4):
+            panel = _GeometryPanel(n, self)
+            root.addWidget(panel)
+            self._panels.append(panel)
+
+        # Grid & interpolation parameters
+        grp_grid = QGroupBox("Grid & Interpolation Parameters")
+        lay_grid = QGridLayout()
+        lay_grid.setColumnStretch(1, 1)
+        lay_grid.setColumnStretch(3, 1)
+        grp_grid.setLayout(lay_grid)
+
+        lay_grid.addWidget(QLabel("Grid NX:"), 0, 0)
+        self.spnNX = QSpinBox()
+        self.spnNX.setRange(10, 2000)
+        self.spnNX.setValue(100)
+        lay_grid.addWidget(self.spnNX, 0, 1)
+
+        lay_grid.addWidget(QLabel("Grid NY:"), 0, 2)
+        self.spnNY = QSpinBox()
+        self.spnNY.setRange(10, 2000)
+        self.spnNY.setValue(100)
+        lay_grid.addWidget(self.spnNY, 0, 3)
+
+        lay_grid.addWidget(QLabel("Max interp. distance:"), 1, 0)
+        self.spnMaxDist = QDoubleSpinBox()
+        self.spnMaxDist.setRange(0.0, 1e7)
+        self.spnMaxDist.setValue(1000.0)
+        self.spnMaxDist.setDecimals(0)
+        self.spnMaxDist.setToolTip(
+            "Grid cells farther than this from the nearest input point\n"
+            "are masked as invalid (same unit as the layer CRS).")
+        lay_grid.addWidget(self.spnMaxDist, 1, 1)
+
+        lay_grid.addWidget(QLabel("Smoothing σ (px):"), 1, 2)
+        self.spnSigma = QDoubleSpinBox()
+        self.spnSigma.setRange(0.0, 20.0)
+        self.spnSigma.setValue(1.5)
+        self.spnSigma.setSingleStep(0.5)
+        self.spnSigma.setToolTip("Gaussian smoothing applied to interpolated grids.")
+        lay_grid.addWidget(self.spnSigma, 1, 3)
+
+        lay_grid.addWidget(QLabel("Solve for:"), 2, 0)
+        self.chkSolveNorth = QCheckBox(
+            "Include North component  (solve for E + N + U — exact 3×3 system)")
+        self.chkSolveNorth.setChecked(True)
+        self.chkSolveNorth.setToolTip(
+            "Checked: solve the exact 3×3 system for dE, dN, dU.\n"
+            "Unchecked: solve overdetermined 3×2 system for dE and dU only\n"
+            "(assumes North displacement ≈ 0, which is common for InSAR).")
+        lay_grid.addWidget(self.chkSolveNorth, 2, 1, 1, 3)
+
+        lay_grid.addWidget(QLabel("Condition threshold (10^n):"), 3, 0)
+        self.spnCondExp = QSpinBox()
+        self.spnCondExp.setRange(2, 12)
+        self.spnCondExp.setValue(4)
+        self.spnCondExp.setToolTip(
+            "Grid cells whose look-vector matrix condition number exceeds\n"
+            "10^n are treated as geometrically degenerate and set to NaN.\n"
+            "This happens when two geometries are nearly parallel.\n"
+            "  n=2  → 100   (strict — rejects mildly poor geometry)\n"
+            "  n=4  → 10 000 (default)\n"
+            "  n=6  → 1 000 000 (lenient — keeps more data)\n"
+            "A diagnostic layer 'LOS_condition_number' is always added\n"
+            "to QGIS so you can inspect where masking occurred.")
+        lay_grid.addWidget(self.spnCondExp, 3, 1)
+        self._lblCondValue = QLabel("= 10 000")
+        self.spnCondExp.valueChanged.connect(
+            lambda n: self._lblCondValue.setText(f"= {10**n:,.0f}"))
+        lay_grid.addWidget(self._lblCondValue, 3, 2, 1, 2)
+
+        root.addWidget(grp_grid)
+
+        # Moving Area Detection
+        grp_ma = QGroupBox("Moving Area Detection")
+        grp_ma.setCheckable(True)
+        grp_ma.setChecked(False)
+        grp_ma.setToolTip(
+            "When enabled, the selected decomposed component is classified\n"
+            "into moving / stable pixels using a velocity threshold and an\n"
+            "optional neural-network refinement step.")
+        self.grpMA = grp_ma
+        lay_ma = QGridLayout()
+        lay_ma.setColumnStretch(1, 1)
+        lay_ma.setColumnStretch(3, 1)
+        grp_ma.setLayout(lay_ma)
+
+        # Row 0: component + threshold
+        lay_ma.addWidget(QLabel("Component:"), 0, 0)
+        self.cmbMAComponent = QComboBox()
+        self.cmbMAComponent.addItems(["Magnitude (|dE|²+|dU|²)½", "East-West (dE)",
+                                      "Up-Down (dU)", "North-South (dN)"])
+        self.cmbMAComponent.setToolTip(
+            "Decomposed displacement component on which moving area\n"
+            "detection is applied.")
+        lay_ma.addWidget(self.cmbMAComponent, 0, 1)
+
+        lay_ma.addWidget(QLabel("Velocity threshold:"), 0, 2)
+        self.spnMAThreshold = QDoubleSpinBox()
+        self.spnMAThreshold.setRange(0.01, 1000.0)
+        self.spnMAThreshold.setValue(2.0)
+        self.spnMAThreshold.setDecimals(2)
+        self.spnMAThreshold.setToolTip(
+            "Threshold applied to the decomposed velocity component selected above.\n"
+            "Must be in the same units as the input LOS field (typically mm/yr for\n"
+            "EGMS/PS-InSAR data).  Points whose |velocity| exceeds this value are\n"
+            "initially labelled as 'moving'.")
+        lay_ma.addWidget(self.spnMAThreshold, 0, 3)
+
+        # Row 1: k-neighbors + epochs
+        lay_ma.addWidget(QLabel("k neighbors:"), 1, 0)
+        self.spnMAK = QSpinBox()
+        self.spnMAK.setRange(3, 200)
+        self.spnMAK.setValue(20)
+        self.spnMAK.setToolTip("Number of nearest neighbors used for feature extraction.")
+        lay_ma.addWidget(self.spnMAK, 1, 1)
+
+        lay_ma.addWidget(QLabel("NN epochs:"), 1, 2)
+        self.spnMAEpochs = QSpinBox()
+        self.spnMAEpochs.setRange(1, 500)
+        self.spnMAEpochs.setValue(50)
+        self.spnMAEpochs.setToolTip(
+            "Training epochs per neural-network refinement iteration.\n"
+            "Only used when 'Use neural network' is checked.")
+        lay_ma.addWidget(self.spnMAEpochs, 1, 3)
+
+        # Row 2: min cluster size + use NN
+        lay_ma.addWidget(QLabel("Min cluster size:"), 2, 0)
+        self.spnMAMinCluster = QSpinBox()
+        self.spnMAMinCluster.setRange(1, 10000)
+        self.spnMAMinCluster.setValue(10)
+        self.spnMAMinCluster.setToolTip(
+            "Clusters with fewer than this many moving points are discarded.")
+        lay_ma.addWidget(self.spnMAMinCluster, 2, 1)
+
+        self.chkMAUseNN = QCheckBox("Use neural network refinement")
+        self.chkMAUseNN.setChecked(True)
+        self.chkMAUseNN.setToolTip(
+            "Refine the initial threshold labels using a small MLP classifier\n"
+            "(requires PyTorch). Uncheck for threshold-only classification.")
+        lay_ma.addWidget(self.chkMAUseNN, 2, 2, 1, 2)
+
+        # Row 3: boundary shapefile output
+        lay_ma.addWidget(QLabel("Boundary shapefile:"), 3, 0)
+        self.txtMAOutput = QLineEdit()
+        self.txtMAOutput.setPlaceholderText("Leave blank to skip shapefile export")
+        lay_ma.addWidget(self.txtMAOutput, 3, 1, 1, 2)
+        self.btnMABrowse = QPushButton("...")
+        self.btnMABrowse.setFixedWidth(30)
+        self.btnMABrowse.clicked.connect(self._browse_ma_output)
+        lay_ma.addWidget(self.btnMABrowse, 3, 3)
+
+        root.addWidget(grp_ma)
+
+        # Output
+        grp_out = QGroupBox("Output")
+        lay_out = QGridLayout()
+        lay_out.setColumnStretch(1, 1)
+        grp_out.setLayout(lay_out)
+
+        lay_out.addWidget(QLabel("Output CSV (optional):"), 0, 0)
+        self.txtOutput = QLineEdit()
+        self.txtOutput.setPlaceholderText("Leave blank to skip CSV export")
+        lay_out.addWidget(self.txtOutput, 0, 1)
+        self.btnBrowse = QPushButton("...")
+        self.btnBrowse.setFixedWidth(30)
+        lay_out.addWidget(self.btnBrowse, 0, 2)
+
+        root.addWidget(grp_out)
+
+        # Run / status row
+        run_row = QHBoxLayout()
+        self.btnRun = QPushButton("Run Decomposition")
+        self.btnRun.setMinimumHeight(30)
+        run_row.addWidget(self.btnRun)
+        self.lblStatus = QLabel("Ready")
+        run_row.addWidget(self.lblStatus, 1)
+        root.addLayout(run_row)
+
+        self.progressBar = QProgressBar()
+        self.progressBar.setValue(0)
+        root.addWidget(self.progressBar)
+
+    # ------------------------------------------------------------------
+    def _connect_signals(self):
+        self.btnRun.clicked.connect(self._run)
+        self.btnBrowse.clicked.connect(self._browse_output)
+
+    def _browse_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Decomposition CSV", "", "CSV Files (*.csv)")
+        if path:
+            if not path.lower().endswith('.csv'):
+                path += '.csv'
+            self.txtOutput.setText(path)
+
+    def _browse_ma_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Moving Area Boundary Shapefile", "",
+            "Shapefiles (*.shp)")
+        if path:
+            if not path.lower().endswith('.shp'):
+                path += '.shp'
+            self.txtMAOutput.setText(path)
+
+    # ------------------------------------------------------------------
+    def _run(self):
+        import numpy as np
+
+        # Collect and validate geometry configs
+        configs = []
+        for i, panel in enumerate(self._panels):
+            cfg = panel.get_config()
+            if cfg is None:
+                QMessageBox.warning(
+                    self, "Missing layer",
+                    f"Please select a PS-InSAR layer for Geometry {i + 1}.")
+                return
+            if not cfg['vel_field']:
+                QMessageBox.warning(
+                    self, "Missing field",
+                    f"Please select a LOS velocity field for Geometry {i + 1}.")
+                return
+            configs.append(cfg)
+
+        output_path = self.txtOutput.text().strip() or None
+
+        # Moving area parameters
+        ma_enabled   = self.grpMA.isChecked()
+        _comp_map    = {0: 'magnitude', 1: 'ew', 2: 'ud', 3: 'ns'}
+        ma_component = _comp_map.get(self.cmbMAComponent.currentIndex(), 'magnitude')
+        ma_output    = self.txtMAOutput.text().strip() or None
+
+        processor = LOSDecompositionProcessor(
+            layer_configs=configs,
+            grid_nx=self.spnNX.value(),
+            grid_ny=self.spnNY.value(),
+            max_distance=self.spnMaxDist.value(),
+            smoothing_sigma=self.spnSigma.value(),
+            solve_north=self.chkSolveNorth.isChecked(),
+            output_path=output_path,
+            cond_threshold=10 ** self.spnCondExp.value(),
+            ma_enabled=ma_enabled,
+            ma_component=ma_component,
+            ma_vel_threshold=self.spnMAThreshold.value(),
+            ma_k_neighbors=self.spnMAK.value(),
+            ma_epochs=self.spnMAEpochs.value(),
+            ma_refinement_iters=1,
+            ma_min_cluster_size=self.spnMAMinCluster.value(),
+            ma_alpha=0.0,
+            ma_use_nn=self.chkMAUseNN.isChecked(),
+            ma_output_path=ma_output,
+        )
+
+        self.btnRun.setEnabled(False)
+        self.progressBar.setValue(0)
+        self.lblStatus.setText("Running…")
+
+        try:
+            from qgis.core import QgsApplication
+
+            def cb(val, msg=''):
+                self.progressBar.setValue(val)
+                if msg:
+                    self.lblStatus.setText(msg)
+                QgsApplication.processEvents()
+
+            results = processor.run(progress_callback=cb)
+
+            dE, dU = results['dE'], results['dU']
+            n_valid = int(np.isfinite(dE).sum())
+
+            summary = (
+                f"Decomposition complete.\n\n"
+                f"Valid grid cells : {n_valid}\n"
+                f"East-West  range : {np.nanmin(dE):.2f} – {np.nanmax(dE):.2f} mm/yr\n"
+                f"Up-Down    range : {np.nanmin(dU):.2f} – {np.nanmax(dU):.2f} mm/yr"
+            )
+            if self.chkSolveNorth.isChecked():
+                dN = results['dN']
+                summary += (
+                    f"\nNorth-South range: "
+                    f"{np.nanmin(dN):.2f} – {np.nanmax(dN):.2f} mm/yr"
+                )
+            if output_path:
+                summary += f"\n\nCSV written to:\n{output_path}"
+
+            self.lblStatus.setText(
+                f"Done — {n_valid} cells, "
+                f"dE [{np.nanmin(dE):.1f}, {np.nanmax(dE):.1f}], "
+                f"dU [{np.nanmin(dU):.1f}, {np.nanmax(dU):.1f}]")
+            self.progressBar.setValue(100)
+
+            QMessageBox.information(
+                self, "InSAR LOS Decomposition Complete", summary)
+
+        except Exception as e:
+            self.lblStatus.setText(f"Error: {e}")
+            QgsMessageLog.logMessage(
+                f"LOS decomposition error: {e}", "TestPlugin", Qgis.Critical)
+            import traceback
+            QgsMessageLog.logMessage(
+                traceback.format_exc(), "TestPlugin", Qgis.Critical)
+            QMessageBox.critical(
+                self, "Decomposition Error",
+                f"LOS decomposition failed:\n{e}")
+        finally:
+            self.btnRun.setEnabled(True)

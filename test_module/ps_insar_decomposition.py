@@ -2,8 +2,10 @@
 """
 InSAR LOS Decomposition and Surface Evolution Module
 
-Python conversion of the MATLAB toolkit from:
-  ottaviani2/InSAR-Decomposition-and-Landslide-movement-estimation
+Python conversion of the MATLAB toolkit:
+  GitHub: ottaviani2/InSAR-Decomposition-and-Landslide-movement-estimation
+  (No peer-reviewed journal publication identified for this toolkit;
+   cite as unpublished software if used in academic work.)
 
 Provides:
   - LOS velocity decomposition into slope-parallel, vertical, and normal components
@@ -12,8 +14,19 @@ Provides:
   - Point cloud rotation utilities
   - Thickness estimation from empirical area-depth relationships
 
-References:
-  - Ottaviani et al., InSAR Decomposition and Landslide movement estimation
+References
+----------
+Surface evolution PDE (mass conservation, depth-averaged thin-layer flow):
+  Hungr, O. (1995): A model for the runout analysis of rapid flow slides,
+  debris flows and avalanches. Can. Geotech. J., 32(4), 610–623.
+  doi:10.1139/t95-063
+
+LOS decomposition into slope-referenced components:
+  Colesanti, C. & Wasowski, J. (2006): Investigating landslides with
+  space-borne Synthetic Aperture Radar (SAR) interferometry.
+  Eng. Geol., 88(3–4), 173–199. doi:10.1016/j.enggeo.2006.09.013
+
+Depth–area empirical scaling — see DEPTH_FORMULAS dict for per-formula refs.
 """
 
 import numpy as np
@@ -242,9 +255,9 @@ class LOSDecomposer:
         Returns
         -------
         result : dict with keys:
-            'DK' : ndarray - slope-parallel velocity grid
-            'DT' : ndarray - vertical velocity grid
-            'DI' : ndarray - normal velocity grid
+            'DK' : ndarray - slope-parallel (down-dip) velocity grid
+            'DT' : ndarray - transverse (across-slope) velocity grid
+            'DI' : ndarray - slope-normal velocity grid
             'X', 'Y' : ndarray - meshgrid coordinates
             'x', 'y' : 1D coordinate arrays
         """
@@ -350,9 +363,9 @@ class LOSDecomposer:
                 # Least-squares solution via pseudo-inverse
                 try:
                     S = np.linalg.pinv(A) @ los_values
-                    DK[i, j] = S[0]  # slope-parallel
-                    DT[i, j] = S[1]  # vertical
-                    DI[i, j] = S[2]  # normal
+                    DK[i, j] = S[0]  # slope-parallel (down-dip)
+                    DT[i, j] = S[1]  # transverse (across-slope)
+                    DI[i, j] = S[2]  # slope-normal
                 except np.linalg.LinAlgError:
                     continue
 
@@ -466,7 +479,7 @@ def get_perimeter(mask):
 # Moving area detection
 # ---------------------------------------------------------------------------
 
-def detect_moving_area(vx, vy, boundary_buffer=2):
+def detect_moving_area(vx, vy, boundary_buffer=2, threshold_mmday=0.1):
     """
     Detect moving area from velocity components.
     Returns (interior_mask, moving_mask).
@@ -474,14 +487,18 @@ def detect_moving_area(vx, vy, boundary_buffer=2):
     Parameters
     ----------
     vx, vy : ndarray
-        Velocity component grids (slope-parallel, vertical).
+        Velocity component grids in mm/day (slope-parallel, vertical).
     boundary_buffer : int
         Number of perimeter layers to erode from the moving mask.
+    threshold_mmday : float
+        Minimum velocity magnitude [mm/day] to classify a cell as moving.
+        Default 0.1 mm/day ≈ 36 mm/yr, typical for slow PS-InSAR landslides.
 
     Returns
     -------
     interior_mask : ndarray (bool)
         Interior calculation domain (moving area minus boundary buffer).
+        Same orientation as the input vx/vy grids (no flip applied).
     moving_mask : ndarray (bool)
         Full moving area mask.
     """
@@ -490,13 +507,7 @@ def detect_moving_area(vx, vy, boundary_buffer=2):
         + np.where(np.isnan(vy), 0, vy)**2
     )
 
-    # Adaptive threshold
-    vel_std = np.nanstd(velocity_magnitude)
-    vel_mean = np.nanmean(velocity_magnitude)
-    movement_threshold = max(vel_mean - 100 * vel_std, 0)
-    # The original MATLAB uses threshold = -100 (effectively all points)
-
-    moving_mask = (velocity_magnitude > movement_threshold) & ~np.isnan(velocity_magnitude)
+    moving_mask = (velocity_magnitude > threshold_mmday) & ~np.isnan(velocity_magnitude)
 
     # Clean up: morphological filtering
     moving_mask = clean_binary_mask(moving_mask)
@@ -504,8 +515,8 @@ def detect_moving_area(vx, vy, boundary_buffer=2):
     # Keep only largest connected component
     moving_mask = largest_connected_component(moving_mask)
 
-    # Interior mask: erode boundary
-    interior_mask = np.flipud(moving_mask.copy())
+    # Interior mask: erode boundary (same orientation as vx/vy — no flip)
+    interior_mask = moving_mask.copy()
 
     for _ in range(boundary_buffer):
         perim = get_perimeter(interior_mask)
@@ -705,7 +716,16 @@ class SurfaceEvolutionSolver:
 
         dh/dt = -div(h * f * v)
 
-    Using explicit finite differences on a regular grid.
+    Using explicit (Forward Euler) finite differences on a regular grid.
+
+    The PDE is the depth-averaged mass conservation equation for a
+    thin granular layer, where f is a basal friction/rheological factor
+    that modulates the effective velocity field.
+
+    Reference:
+        Hungr, O. (1995): A model for the runout analysis of rapid flow
+        slides, debris flows and avalanches.
+        Can. Geotech. J., 32(4), 610–623. doi:10.1139/t95-063
 
     Parameters
     ----------
@@ -721,7 +741,7 @@ class SurfaceEvolutionSolver:
         self.grid_ny = grid_ny
 
     def run(self, h_initial, vx_series, vy_series, dt_series,
-            interior_masks=None, progress_callback=None):
+            dx=1.0, dy=1.0, interior_masks=None, progress_callback=None):
         """
         Run the surface evolution over a time-series of velocity fields.
 
@@ -735,6 +755,13 @@ class SurfaceEvolutionSolver:
             Vertical velocity grids for each time step.
         dt_series : list of float
             Time increment (days) for each step.
+        dx : float
+            Grid spacing in the x-direction (metres). Defaults to 1.0 (pixel
+            units); pass real-world spacing to obtain physically correct
+            thickness-change magnitudes.
+        dy : float
+            Grid spacing in the y-direction (metres). Defaults to 1.0 (pixel
+            units).
         interior_masks : list of ndarray (bool) or None
             Calculation masks for each step. If None, computed automatically.
         progress_callback : callable or None
@@ -749,11 +776,14 @@ class SurfaceEvolutionSolver:
             'area_series' : list of float - moving area per time step
         """
         ny, nx = h_initial.shape
-        dx = 1.0
-        dy = 1.0
 
-        # Estimate grid spacing from first velocity field if possible
-        # (caller should set this via x/y coordinate arrays)
+        if dx == 1.0 or dy == 1.0:
+            QgsMessageLog.logMessage(
+                "SurfaceEvolutionSolver.run(): dx and/or dy are 1.0 (pixel units). "
+                "thickness_change magnitudes and area_series values will be in pixel "
+                "units, not metres/m².  Pass real-world grid spacing for physically "
+                "meaningful results, or use run_with_grid_spacing() instead.",
+                "TestPlugin", Qgis.Warning)
 
         n_steps = len(vx_series)
         h = h_initial.copy()
@@ -777,18 +807,18 @@ class SurfaceEvolutionSolver:
                 interior_mask, _ = detect_moving_area(vx, vy)
 
             n_interior = interior_mask.sum()
-            area_series.append(float(n_interior * nx * ny))
+            # area = n_interior pixels × pixel area (dx=dy=1 in this method)
+            area_series.append(float(n_interior * dx * dy))
 
             h_new = h.copy()
 
             # Surface evolution PDE: dh/dt = -div(h * f * v)
+            # h and vx/vy share the same grid orientation (h_initial was
+            # flipped upstream to match the decomposer Y_flipped output).
             for i in range(1, ny - 1):
                 for j in range(1, nx - 1):
-                    i_rev = ny - 2 - i
-
-                    if not interior_mask[i_rev, j]:
-                        h_new[i_rev, j] = h[i_rev, j]
-                        continue
+                    if not interior_mask[i, j]:
+                        continue  # h_new[i,j] already equals h[i,j]
 
                     v_eff_x = self.f * vx[i, j]
                     v_eff_y = self.f * vy[i, j]
@@ -807,10 +837,16 @@ class SurfaceEvolutionSolver:
                     if np.isnan(dh_dt):
                         dh_dt = 0.0
 
+                    # Unit derivation:
+                    #   vx      [mm/day]  = displacement[mm] / dt_days[day]
+                    #   term1_x [mm/day]  = vx[mm/day] * (dh/dx)[m/m]        (dimensionless ratio)
+                    #   term2_x [mm/day]  = h[m] * (d(f·vx)/dx)[mm/day / m]  → mm/day
+                    #   flux_divergence [mm/day], dh_dt [mm/day]
+                    #   delta_h = dt[day] * dh_dt[mm/day] / 1000             → [m]
+                    # No days→years conversion needed: vx is already in mm/day.
                     delta_h = dt * dh_dt / 1000.0
-                    delta_h = max(delta_h, 0.0)
-
-                    h_new[i_rev, j] = h[i_rev, j] + dt * dh_dt / 1000.0
+                    # Clamp: thickness cannot go negative (physical constraint).
+                    h_new[i, j] = max(h[i, j] + delta_h, 0.0)
 
             # Boundary conditions: fixed to initial values
             h_new[:, 0] = h_saved[:, 0]
@@ -871,11 +907,8 @@ class SurfaceEvolutionSolver:
 
             for i in range(1, ny - 1):
                 for j in range(1, nx - 1):
-                    i_rev = ny - 2 - i
-
-                    if not interior_mask[i_rev, j]:
-                        h_new[i_rev, j] = h[i_rev, j]
-                        continue
+                    if not interior_mask[i, j]:
+                        continue  # h_new[i,j] already equals h[i,j]
 
                     v_eff_x = self.f * vx[i, j]
                     v_eff_y = self.f * vy[i, j]
@@ -891,7 +924,9 @@ class SurfaceEvolutionSolver:
                     if np.isnan(dh_dt):
                         dh_dt = 0.0
 
-                    h_new[i_rev, j] = h[i_rev, j] + dt * dh_dt / 1000.0
+                    delta_h = dt * dh_dt / 1000.0
+                    # Clamp: thickness cannot go negative (physical constraint).
+                    h_new[i, j] = max(h[i, j] + delta_h, 0.0)
 
             h_new[:, 0] = h_saved[:, 0]
             h_new[:, -1] = h_saved[:, -1]
@@ -923,25 +958,35 @@ def estimate_thickness_from_area(area_m2):
     """
     Legacy wrapper — prefer estimate_depth_from_area().
 
-    Estimate landslide thickness from area using empirical relationships.
+    WARNING: The regression source (Simoni et al., 2013) and the logarithm
+    base (ln vs log₁₀) for both formulas are UNVERIFIED.  If the original
+    regression used log₁₀ (common in geomorphology), replacing np.log/np.exp
+    with np.log10/10** would reduce the prefactor by ~4.7×.  Do NOT use these
+    values in published work without tracing the original source.
 
-    Circular geometry (Simonini et al., 2013):
-        log(D) = 0.44 * log(A) - 1.18
+    Assumed form — natural logarithm (np.log = ln):
 
-    Unknown geometry:
-        W = exp(0.42 * log(A) + 1.13)
+    Circular geometry (attributed to Simoni et al., 2013 — UNVERIFIED):
+        ln(D) = 0.44·ln(A) - 1.18  →  D = e^(-1.18)·A^0.44 ≈ 0.307·A^0.44  [m]
+
+    Unknown-geometry width estimate (source UNVERIFIED):
+        ln(W) = 0.42·ln(A) + 1.13  →  W = e^(1.13)·A^0.42  ≈ 3.09·A^0.42   [m]
+        NOTE: W appears to represent along-slope *width*, not depth/thickness.
+        Values of W are typically ~10× larger than D for the same area, which
+        is physically unreasonable for a thickness but plausible for a width.
 
     Parameters
     ----------
     area_m2 : float
-        Moving area in square meters.
+        Moving area in square meters (m²).
 
     Returns
     -------
     D : float
-        Estimated thickness for circular geometry (meters).
+        Estimated depth/thickness for circular geometry [metres].
     W : float
-        Estimated thickness for unknown geometry (meters).
+        Estimated along-slope width for unknown geometry [metres].
+        (Labelled 'thickness' historically but likely represents width.)
     """
     if area_m2 <= 0:
         return 0.0, 0.0
@@ -965,7 +1010,16 @@ DEPTH_FORMULAS = {
         'label': 'Guzzetti et al. (2009) — Mixed types, Central Italy',
         'alpha': 0.1078,
         'beta': 0.4130,
-        'ref': 'Nat. Hazards Earth Syst. Sci. 9(4), 1085–1098',
+        'ref': (
+            'Guzzetti, F., Ardizzone, F., Cardinali, M., Rossi, M., Valigi, D. '
+            '(2009): Landslide volumes and landslide mobilization rates in Umbria, '
+            'central Italy. Earth Planet. Sci. Lett., 279, 222–229. '
+            'doi:10.1016/j.epsl.2009.01.005. '
+            'NOTE: the paper publishes V = 0.074·A^1.45 (volume–area); the D–A '
+            'coefficients here (α=0.1078, β=0.413) are from a direct depth–area '
+            'regression and differ from D = V/A = 0.074·A^0.45. Verify against '
+            'Table 1 of the original paper before use.'
+        ),
         'desc': (
             'Derived from 677 mixed landslides (slides, flows, complex) in '
             'Umbria, central Italy (flysch, marly limestones). Most widely '
@@ -976,7 +1030,13 @@ DEPTH_FORMULAS = {
         'label': 'Larsen et al. (2010) — Soil / regolith slides (global)',
         'alpha': 0.4840,
         'beta': 0.3290,
-        'ref': 'Nature Geoscience 3, 462–465',
+        'ref': (
+            'Larsen, I.J., Montgomery, D.R., Korup, O. (2010): Landslide erosion '
+            'controlled by hillslope material. Nature Geoscience, 3, 247–251. '
+            'doi:10.1038/ngeo776. '
+            'Coefficients verified: log10(D) = 0.329·log10(A) − 0.315 '
+            '→ α = 10^−0.315 = 0.484.'
+        ),
         'desc': (
             'Global compilation of ~2,500 soil/regolith landslides across '
             'diverse climatic and tectonic settings. Best for shallow '
@@ -987,7 +1047,13 @@ DEPTH_FORMULAS = {
         'label': 'Larsen et al. (2010) — Bedrock slides (global)',
         'alpha': 0.1570,
         'beta': 0.4120,
-        'ref': 'Nature Geoscience 3, 462–465',
+        'ref': (
+            'Larsen, I.J., Montgomery, D.R., Korup, O. (2010): Landslide erosion '
+            'controlled by hillslope material. Nature Geoscience, 3, 247–251. '
+            'doi:10.1038/ngeo776. '
+            'Coefficients verified: log10(D) = 0.412·log10(A) − 0.804 '
+            '→ α = 10^−0.804 = 0.157.'
+        ),
         'desc': (
             'Global compilation of ~1,700 bedrock landslides. Best for rock '
             'slides and deep-seated failures in hard rock. Bedrock slides '
@@ -998,18 +1064,30 @@ DEPTH_FORMULAS = {
         'label': 'Larsen et al. (2010) — All types combined (global)',
         'alpha': 0.2840,
         'beta': 0.3510,
-        'ref': 'Nature Geoscience 3, 462–465',
+        'ref': (
+            'Larsen, I.J., Montgomery, D.R., Korup, O. (2010): Landslide erosion '
+            'controlled by hillslope material. Nature Geoscience, 3, 247–251. '
+            'doi:10.1038/ngeo776. '
+            'Coefficients verified: log10(D) = 0.351·log10(A) − 0.547 '
+            '→ α = 10^−0.547 = 0.284.'
+        ),
         'desc': (
             'Combined global dataset (~4,231 landslides), all material types. '
             'Use when landslide type (soil vs. bedrock) is unknown '
             '(A ≈ 1–10⁹ m²).'
         ),
     },
-    'marc_2019': {
-        'label': 'Marc et al. (2019) — Rainfall-triggered (global)',
+    'marc_2018': {
+        'label': 'Marc et al. (2018) — Rainfall-triggered (global)',
         'alpha': 0.1330,
         'beta': 0.3990,
-        'ref': 'NHESS / EPSL global rainfall-induced inventory',
+        'ref': (
+            'UNVERIFIED — precise source paper for α=0.133, β=0.399 not confirmed. '
+            'Possible source: Marc, O., et al. (2018): Initial insights from a global '
+            'database of rainfall-induced landslide inventories. '
+            'Earth Surf. Dynam., 6, 903–922. doi:10.5194/esurf-6-903-2018. '
+            'Cross-check coefficients against the original publication before use.'
+        ),
         'desc': (
             'Rainfall-triggered landslides globally across diverse climatic '
             'and lithological settings. Consistent with Guzzetti (2009) '
@@ -1017,10 +1095,20 @@ DEPTH_FORMULAS = {
         ),
     },
     'tanyas_2017': {
-        'label': 'Tanyas et al. (2017) — Coseismic landslides (global)',
+        'label': 'Tanyaş et al. (2017) — Coseismic landslides (global)',
         'alpha': 0.1370,
         'beta': 0.4000,
-        'ref': 'JGR Earth Surface 122(8), 1595–1615',
+        'ref': (
+            'Tanyaş, H., van Westen, C.J., Allstadt, K.E., et al. (2017): '
+            'Presentation and Analysis of a Worldwide Database of '
+            'Earthquake-Induced Landslide Inventories. '
+            'J. Geophys. Res. Earth Surf., 122(10), 1991–2015. '
+            'doi:10.1002/2017JF004236. '
+            'NOTE: previous entry had wrong issue (8) and wrong pages (1595–1615); '
+            'correct is issue 10, pp. 1991–2015. '
+            'Depth–area coefficients (α=0.137, β=0.400) should be verified '
+            'against the paper tables before use.'
+        ),
         'desc': (
             'Earthquake-triggered landslides globally, compiled from major '
             'seismic events (Wenchuan 2008, Haiti 2010, etc.). Use for '
@@ -1031,7 +1119,15 @@ DEPTH_FORMULAS = {
         'label': 'Guthrie & Evans (2004) — Shallow debris (BC, Canada)',
         'alpha': 0.0500,
         'beta': 0.4500,
-        'ref': 'Geomorphology 61(1–2), 141–153',
+        'ref': (
+            'Guthrie, R.H. & Evans, S.G. (2004): Analysis of landslide frequencies '
+            'and characteristics in a natural system, coastal British Columbia. '
+            'Earth Surf. Process. Landforms, 29(11), 1321–1339. '
+            'doi:10.1002/esp.1095. '
+            'UNVERIFIED: depth–area coefficients (α=0.050, β=0.450) not confirmed '
+            'in the cited paper. The paper may report volume–area or frequency '
+            'relationships rather than a direct D–A fit. Verify before use.'
+        ),
         'desc': (
             'Shallow debris avalanches and flows in steep, forested coastal '
             'terrain (British Columbia, Canada). Not suitable for deep-seated '
@@ -1083,7 +1179,9 @@ class InSARDecompositionProcessor:
                  slope_azimuth_deg=270.0, slope_angle_deg=50.0,
                  friction_coeff=0.01, grid_nx=100, grid_ny=100,
                  max_distance=100.0, date_col_offset=28,
-                 smoothing_sigma=1.5, depth_formula='guzzetti_2009'):
+                 smoothing_sigma=1.5, depth_formula='guzzetti_2009',
+                 include_vertical_velocity=False,
+                 movement_threshold_mmday=0.1):
         self.csv_paths = csv_paths
         self.dtm_path = dtm_path
         self.slope_azimuth_deg = slope_azimuth_deg
@@ -1095,6 +1193,11 @@ class InSARDecompositionProcessor:
         self.date_col_offset = date_col_offset
         self.smoothing_sigma = smoothing_sigma
         self.depth_formula = depth_formula
+        # If True, vertical slope-component (DT) is included in vy;
+        # if False, only slope-parallel motion (DK) drives the PDE.
+        self.include_vertical_velocity = include_vertical_velocity
+        # Minimum velocity magnitude [mm/day] to classify a cell as moving.
+        self.movement_threshold_mmday = movement_threshold_mmday
 
     def load_csv_datasets(self):
         """
@@ -1187,8 +1290,10 @@ class InSARDecompositionProcessor:
         if progress_callback:
             progress_callback(8, "Initializing height from DTM...")
 
-        # Initialize height
-        h_initial = initialize_height_from_dtm(self.dtm_path, x, y)
+        # Initialize height on the ascending-y grid, then flip to match the
+        # decomposer's Y_flipped orientation (row 0 = y_max) so that h and
+        # vx/vy share the same row ordering throughout the PDE solver.
+        h_initial = np.flipud(initialize_height_from_dtm(self.dtm_path, x, y))
 
         if progress_callback:
             progress_callback(10, "Running time-series decomposition...")
@@ -1242,17 +1347,35 @@ class InSARDecompositionProcessor:
             # Decompose for this time step
             result = decomposer.decompose(velocity_data)
 
-            d_x = result['DK']
-            d_y = result['DT']
+            d_x = result['DK']   # slope-parallel displacement [mm], epoch
+            d_y = result['DT']   # transverse (across-slope) displacement [mm], epoch
 
-            vx = -d_x / dt_days
-            vy = np.zeros_like(vx)  # as in original MATLAB: vy = zeros
+            # Sign convention:
+            #   Positive LOS = motion TOWARD satellite (range decrease).
+            #   After slope-frame decomposition, positive DK therefore means
+            #   motion toward the satellite projected onto the slope — which
+            #   for ascending right-looking geometry (heading ~350°, look right)
+            #   is predominantly UP-SLOPE.
+            #   The PDE dh/dt = -div(h·f·v) removes mass from where div(v) > 0
+            #   (diverging / accelerating flow). To model DOWN-SLOPE transport
+            #   (mass leaving the source zone) we need vx to point DOWN-SLOPE,
+            #   so we negate DK before dividing by dt.
+            #   If your data uses the opposite LOS sign (away = positive), remove
+            #   the negation or the model will thicken the source and thin the toe.
+            vx = -d_x / dt_days   # [mm/day], positive = down-slope in slope frame
+            if self.include_vertical_velocity:
+                vy = -d_y / dt_days   # [mm/day], positive = across-slope
+            else:
+                vy = np.zeros_like(vx)
 
             vx_series.append(vx)
             vy_series.append(vy)
 
             # Moving area detection
-            interior_mask, _ = detect_moving_area(vx, vy)
+            interior_mask, _ = detect_moving_area(
+                vx, vy,
+                threshold_mmday=self.movement_threshold_mmday,
+            )
             interior_masks.append(interior_mask)
 
             if progress_callback:

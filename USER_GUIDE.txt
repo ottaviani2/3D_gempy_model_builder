@@ -1,0 +1,255 @@
+================================================================================
+  GemPy 3D Model Builder – QGIS Plugin  |  User Guide
+================================================================================
+
+
+OVERVIEW
+--------
+This plugin builds a 3D geological model from QGIS layers using GemPy and
+displays the result interactively with PyVista. You provide surface points,
+orientation measurements, and a DTM raster; the plugin handles the GemPy
+model setup, computation, and 3D visualisation.
+
+
+REQUIRED INPUTS
+---------------
+Geology layer       CSV vector layer with surface point coordinates and
+                    formation names. Expected columns: X, Y, Z, surface
+                    (the plugin auto-detects the formation column by name).
+
+Orientation layer   CSV vector layer with orientation measurements.
+                    Expected columns: X, Y, Z, G_x, G_y, G_z, surface
+
+DTM layer           Single-band raster (GeoTIFF or similar) covering the
+                    study area. Used to define the vertical model extent
+                    and, optionally, to drape the topography surface.
+
+AOI layer           (Optional) Polygon layer. When set, all input data are
+                    clipped to the polygon before modelling. If the geology
+                    or orientation data do not overlap the AOI, the plugin
+                    will stop and show a clear error — remove the AOI or
+                    choose one that covers your data.
+
+
+RESOLUTION AND DEPTH
+--------------------
+X / Y / Z           Number of cells along each axis (e.g. 10x10x10).
+                    Higher values give finer results but take longer.
+
+Model depth (m)     Vertical distance below the minimum DTM elevation
+                    that the model extends downward.
+
+Plot topography     When checked, the DTM surface is included in the 3D
+                    viewer and in the exported STL files.
+
+
+OUTPUT FOLDER
+-------------
+Select a folder where STL files will be saved when you click "Export STL"
+in the 3D viewer. Each geological surface is saved as a separate STL file.
+The topography surface is saved as Topography.stl (requires numpy-stl).
+
+
+STRUCTURAL GROUPS
+-----------------
+GemPy organises formations into structural groups. Each group has a
+relation type that defines its geometric contact with the groups below it.
+
+The plugin offers two modes:
+
+  AUTO-DETECT (default)
+    The plugin reads the formation column and automatically assigns any
+    formation whose name contains "Fault" to its own FAULT group.
+    All remaining formations are placed in a single ERODE group.
+    The status label on the main dialog shows what was detected.
+
+  MANUAL (Configure Structural Groups button)
+    Opens the full editor where you control every group yourself.
+    The manual configuration is remembered until you change the geology
+    layer, at which point it resets to auto-detect.
+
+
+CONFIGURE STRUCTURAL GROUPS — EDITOR
+-------------------------------------
+Left panel  List of groups ordered YOUNGEST (top) to OLDEST (bottom).
+            The bottom group is always treated as the basement by GemPy.
+
+Right panel Properties of the currently selected group:
+            - Name           Free text label for the group.
+            - Relation type  See table below.
+            - Fault offsets  Only shown when relation = FAULT.
+            - Formations     List of formations assigned to this group.
+
+Buttons:
+  + Append        Add a new empty group at the bottom (oldest position).
+  + Insert above  Insert a new empty group above the selected one.
+                  This is the correct way to add an unconformity between
+                  two existing sequences.
+  - Remove        Delete the selected group (formations become unassigned).
+  Up / Down       Reorder groups (changes stratigraphic age relationship).
+
+Formation assignment:
+  Select a formation from the drop-down and click "Add" to add it to the
+  current group. Select a formation in the list and click "Remove" to
+  move it back to the unassigned pool. Every formation should be assigned
+  to exactly one group before clicking OK.
+
+
+RELATION TYPES
+--------------
+ERODE     Angular unconformity. The top surface of this group truncates
+          (erodes) all older groups below it. Use this when a younger
+          sequence has been deposited unconformably on tilted or folded
+          older rocks, cutting across their bedding.
+
+ONLAP     Onlap unconformity. Younger layers lap onto an older surface
+          without cutting through it. Use this for sedimentary sequences
+          that fill a basin or lap onto a topographic high.
+
+FAULT     Fault surface. This group's formations represent a fault plane
+          that offsets the groups below it. FAULT groups must be placed
+          above (younger than) the formation groups they cut.
+
+BASEMENT  The bottommost unit. GemPy applies this automatically to the
+          last group regardless of what you set here.
+
+
+FAULT OFFSET OPTIONS (only for FAULT groups)
+---------------------------------------------
+OFFSET_ALL          The fault offsets all other groups (formations and
+                    other faults). Default and most common choice.
+
+OFFSET_FORMATIONS   The fault offsets formation groups only, not other
+                    fault groups. Use for faults that do not cross-cut
+                    each other.
+
+OFFSET_NONE         The body cross-cuts existing formations without
+                    displacing them. Use this for dikes, sills, and
+                    other intrusive bodies.
+
+
+MODELLING DIKES AND INTRUSIONS — STEP BY STEP
+----------------------------------------------
+GemPy has no dedicated intrusion relation type. Dikes, sills, and other
+intrusive bodies are modelled using FAULT + OFFSET_NONE:
+  - FAULT tells GemPy the body cross-cuts the existing stratigraphy.
+  - OFFSET_NONE means it fills space without kinematically displacing
+    the host formations.
+
+What you need in your geology CSV:
+  Surface points on both contacts of the intrusion (hanging wall and
+  footwall, or both margins of a dike). If you only have centreline
+  points, add a second set of points offset to the other side.
+  The formation name should be recognisable (e.g. "Dike_1", "Granite").
+
+Step by step:
+
+  1. Make sure your geology CSV includes surface points on the contacts
+     of the intrusion, labelled with a distinctive formation name
+     (e.g. "Dike_1").
+
+  2. Open "Configure Structural Groups".
+
+  3. Click "Insert above" to add a new group at the top (youngest).
+
+  4. Name it (e.g. "dike_series").
+
+  5. Set Relation type  →  FAULT
+     Set Fault offsets  →  OFFSET_NONE
+
+  6. Assign the intrusion formation (e.g. "Dike_1") to this group.
+
+  7. Leave all host formations in their existing ERODE groups below.
+
+  8. Click OK and run the model.
+
+GemPy will compute the intrusion surface as a body that cuts through
+the host formations without shifting them.
+
+Important notes:
+  - Place the intrusion group ABOVE (younger than) the formations it
+    intrudes — same rule as for faults.
+  - Multiple intrusions can each have their own FAULT + OFFSET_NONE
+    group, or share one group if they have similar geometry.
+  - A very thin dike may need a higher model resolution (X/Y/Z values)
+    to be visible in the 3D output.
+
+
+MODELLING UNCONFORMITIES — STEP BY STEP
+-----------------------------------------
+An unconformity requires at least two formation groups with the younger
+group set to ERODE or ONLAP.
+
+Example: angular unconformity between two sequences
+
+  1. Open "Configure Structural Groups".
+  2. You will see the auto-populated groups (faults + default_formation).
+  3. Select the default_formation ERODE group.
+  4. Click "Insert above" — a new empty ERODE group appears above it.
+  5. Rename the new group (e.g. "post_unconformity").
+  6. Assign the younger formations to "post_unconformity".
+  7. Assign the older formations to the group below it
+     (e.g. "pre_unconformity").
+  8. Set the relation of "post_unconformity" to ERODE (already default).
+  9. Click OK.
+
+GemPy will compute the unconformity surface between the two groups
+automatically. The upper group's geometry will truncate the lower group.
+
+Example: onlap unconformity
+
+  Same steps as above, but set the upper group's relation to ONLAP.
+  The younger layers will lap onto the older surface without eroding it.
+
+
+3D VIEWER
+---------
+The 3D viewer opens automatically after the model is computed.
+
+  Reset View    Restore the default camera position.
+  Clear         Remove all surfaces from the viewer.
+  Export STL    Save all surfaces as STL files to the output folder.
+  Opacity       Slider to adjust surface transparency.
+
+Mouse controls (PyVista trackball):
+  Left drag     Rotate
+  Right drag    Zoom
+  Middle drag   Pan
+  Scroll        Zoom
+
+
+CSV FORMAT
+----------
+The plugin auto-detects the formation column by looking for a field named
+"surface" or "formation". If neither is found it uses the last non-
+coordinate column. Coordinate columns (X, Y, Z, G_x, G_y, G_z) are
+always excluded from the search.
+
+Both standard 4-column CSVs (X, Y, Z, surface) and pandas-exported CSVs
+with an unnamed index column are handled automatically.
+
+
+COMMON ERRORS
+-------------
+"AOI filter removed all surface points"
+    Your AOI polygon and geology data are in different geographic areas.
+    Either remove the AOI layer or select one that covers your data.
+
+"ValueError: Inconsistent shapes in StacksStructure"
+    GemPy received a group with no data points. This usually happens when
+    all data were removed by the AOI filter, or a formation name in the
+    manual config does not match any formation in the CSV.
+
+"Displayed 0 surfaces"
+    GemPy computed the model but found no iso-surfaces within the model
+    extent. Check that the formation data are well inside the DTM bounding
+    box and that the model depth is large enough to contain the data.
+
+"numpy-stl not installed"
+    The topography STL export requires numpy-stl. Install it from the
+    QGIS Python console:
+        import subprocess, sys
+        subprocess.run([sys.executable, "-m", "pip", "install", "numpy-stl"])
+
+
+================================================================================

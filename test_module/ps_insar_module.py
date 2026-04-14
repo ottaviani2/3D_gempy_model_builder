@@ -784,6 +784,8 @@ class SurfaceEvolutionProcessor:
                  friction_coeff=0.01, grid_nx=100, grid_ny=100,
                  max_distance=100.0, date_col_offset=28,
                  smoothing_sigma=1.5, depth_formula='guzzetti_2009',
+                 include_vertical_velocity=False,
+                 movement_threshold_mmday=0.1,
                  crs=None):
         self.csv_paths = csv_paths
         self.dtm_path = dtm_path
@@ -797,6 +799,8 @@ class SurfaceEvolutionProcessor:
         self.date_col_offset = date_col_offset
         self.smoothing_sigma = smoothing_sigma
         self.depth_formula = depth_formula
+        self.include_vertical_velocity = include_vertical_velocity
+        self.movement_threshold_mmday = movement_threshold_mmday
         self.crs = crs
 
     def run(self, progress_callback=None):
@@ -826,6 +830,8 @@ class SurfaceEvolutionProcessor:
             date_col_offset=self.date_col_offset,
             smoothing_sigma=self.smoothing_sigma,
             depth_formula=self.depth_formula,
+            include_vertical_velocity=self.include_vertical_velocity,
+            movement_threshold_mmday=self.movement_threshold_mmday,
         )
 
         results = processor.run(progress_callback=progress_callback)
@@ -1089,13 +1095,36 @@ class GempyExporter:
     # ------------------------------------------------------------------
     @staticmethod
     def _convex_hull_area(xs, ys):
-        """Return the 2-D convex-hull area (m²) for the given point set."""
+        """Return the 2-D convex-hull area in m² for the given point set.
+
+        Parameters
+        ----------
+        xs, ys : sequences of float
+            Coordinates in a **projected** (metric) CRS such as UTM or
+            a national grid.  If the layer CRS is geographic (decimal
+            degrees), the returned value will be in degrees² — which is
+            meaningless as m² and will produce a completely wrong depth
+            estimate.  Always reproject to a metric CRS before calling.
+        """
+        # Sanity check: if coordinate magnitudes look like decimal degrees
+        # (|x| ≤ 180, |y| ≤ 90) warn but do not abort — the caller is
+        # responsible for reprojection.
+        x_max = max(abs(v) for v in xs)
+        y_max = max(abs(v) for v in ys)
+        if x_max <= 180.0 and y_max <= 90.0:
+            QgsMessageLog.logMessage(
+                "GempyExporter._convex_hull_area: coordinates appear to be in "
+                "geographic (degree) units.  Area will be in degrees², NOT m².  "
+                "Depth estimates will be wrong.  Reproject the boundary layer to "
+                "a projected metric CRS before exporting.",
+                "TestPlugin", Qgis.Warning)
+
         if len(xs) < 3:
             return 0.0
         try:
             from scipy.spatial import ConvexHull
             hull = ConvexHull(np.column_stack([xs, ys]))
-            return float(hull.volume)   # hull.volume == area in 2-D
+            return float(hull.volume)   # hull.volume == area in 2-D (scipy convention)
         except Exception:
             # Fallback: half the bounding-box area
             return (max(xs) - min(xs)) * (max(ys) - min(ys)) * 0.5
@@ -1111,3 +1140,777 @@ class GempyExporter:
                     k: (round(v, 4) if isinstance(v, float) else v)
                     for k, v in row.items()
                 })
+
+
+# ---------------------------------------------------------------------------
+# 3-Geometry LOS Decomposition
+# ---------------------------------------------------------------------------
+
+def _sym(color):
+    """Return a default point symbol with the given QColor."""
+    from qgis.core import QgsSymbol, QgsWkbTypes
+    s = QgsSymbol.defaultSymbol(QgsWkbTypes.PointGeometry)
+    s.setColor(color)
+    return s
+
+
+class LOSDecompositionProcessor:
+    """
+    Decompose 3-geometry InSAR LOS velocities into East-West, Up-Down
+    (and optionally North-South) displacement rate components.
+
+    Look-vector convention (right-looking SAR):
+        look_azimuth = satellite_heading + 90°   (clockwise from North)
+        eE =  sin(θ) · sin(look_az)
+        eN =  sin(θ) · cos(look_az)
+        eU =  cos(θ)
+
+    where θ is the incidence angle measured from the vertical (nadir).
+    Satellite heading H is the flight azimuth clockwise from North
+    (ascending Sentinel-1 ≈ 350°, descending ≈ 190°).
+    For right-looking geometry the radar looks 90° to the right of the
+    flight direction, hence look_az = heading + 90°.
+
+    Reference:
+        Hanssen, R.F. (2001): Radar Interferometry — Data Interpretation and
+        Error Analysis. Kluwer Academic Publishers, Dordrecht.
+        Rosen, P.A., et al. (2000): Synthetic aperture radar interferometry.
+        Proc. IEEE, 88(3), 333–382. doi:10.1109/5.838084
+
+    The LOS measurement is modelled as:
+        d_LOS_i = eE_i · dE + eN_i · dN + eU_i · dU
+
+    With 3 geometries and 3 unknowns the system is exactly determined;
+    with solve_north=False only E and U are solved (overdetermined, solved
+    in least-squares sense via normal equations).
+    """
+
+    def __init__(self, layer_configs, grid_nx=100, grid_ny=100,
+                 max_distance=1000.0, smoothing_sigma=1.5,
+                 solve_north=True, output_path=None,
+                 cond_threshold=1e4,
+                 # Moving area detection
+                 ma_enabled=False,
+                 ma_component='magnitude',
+                 ma_vel_threshold=2.0,
+                 ma_k_neighbors=20,
+                 ma_epochs=50,
+                 ma_refinement_iters=1,
+                 ma_min_cluster_size=10,
+                 ma_alpha=0.0,
+                 ma_use_nn=True,
+                 ma_output_path=None):
+        """
+        Parameters
+        ----------
+        layer_configs : list of exactly 3 dicts, each containing:
+            'layer'     : QgsVectorLayer  (point layer)
+            'vel_field' : str             (LOS velocity attribute name)
+            'inc_field' : str or None     (incidence-angle field; None → inc_const)
+            'inc_const' : float           (constant incidence angle in degrees)
+            'hdg_field' : str or None     (satellite heading field; None → hdg_const)
+            'hdg_const' : float           (constant satellite heading, degrees from N)
+        grid_nx, grid_ny : int
+            Output grid dimensions.
+        max_distance : float
+            Maximum distance from the nearest input point for a grid cell
+            to be considered valid (same units as the layer CRS).
+        smoothing_sigma : float
+            Gaussian smoothing applied to the interpolated grids (pixels).
+        solve_north : bool
+            True  → solve for 3 unknowns (dE, dN, dU) — exact 3×3 system.
+            False → solve for 2 unknowns (dE, dU), assuming dN ≈ 0 —
+                    overdetermined 3×2 system solved by least squares.
+        output_path : str or None
+            If given, decomposition results are written to this CSV file.
+        cond_threshold : float
+            Maximum acceptable condition number of the look-vector matrix A.
+            Grid cells whose condition number exceeds this value are considered
+            geometrically degenerate (two or more geometries nearly parallel)
+            and their solution is set to NaN.  A diagnostic layer named
+            'LOS_condition_number' is added to QGIS so the user can inspect
+            the spatial pattern of ill-conditioning.  Typical values:
+              <  100  : excellent geometry
+              < 1 000 : good
+              < 1e4   : acceptable (default)
+              > 1e4   : poor — treat results with caution
+        ma_enabled : bool
+            If True, run moving area detection on the decomposed data after
+            the LOS inversion.
+        ma_component : str
+            Which decomposed component to use as the "velocity" signal for
+            moving area detection:
+              'magnitude' – √(dE² + dU²)  [default, total displacement rate]
+              'ud'        – vertical (Up-Down) component dU
+              'ew'        – horizontal East-West component dE
+              'ns'        – North-South component dN (requires solve_north=True)
+        ma_vel_threshold : float
+            Velocity magnitude threshold (same units as the layer velocity)
+            used to generate initial pseudo-labels for the classifier.
+        ma_k_neighbors, ma_epochs, ma_refinement_iters : int
+            PSTrainer hyper-parameters.
+        ma_min_cluster_size : int
+            Minimum number of points to form a moving cluster.
+        ma_alpha : float
+            Alpha-shape parameter for boundary extraction (0 = auto).
+        ma_use_nn : bool
+            Whether to use the neural-network refinement step (requires PyTorch).
+        ma_output_path : str or None
+            If given, the moving area boundary is written to this shapefile path.
+        """
+        if len(layer_configs) != 3:
+            raise ValueError("Exactly 3 layer configurations are required.")
+        self.layer_configs = layer_configs
+        self.grid_nx = grid_nx
+        self.grid_ny = grid_ny
+        self.max_distance = max_distance
+        self.smoothing_sigma = smoothing_sigma
+        self.solve_north = solve_north
+        self.output_path = output_path
+        self.cond_threshold = float(cond_threshold)
+        self.ma_enabled = ma_enabled
+        self.ma_component = ma_component
+        self.ma_vel_threshold = ma_vel_threshold
+        self.ma_k_neighbors = ma_k_neighbors
+        self.ma_epochs = ma_epochs
+        self.ma_refinement_iters = ma_refinement_iters
+        self.ma_min_cluster_size = ma_min_cluster_size
+        self.ma_alpha = ma_alpha
+        self.ma_use_nn = ma_use_nn
+        self.ma_output_path = ma_output_path
+
+    # ------------------------------------------------------------------
+    def run(self, progress_callback=None):
+        """
+        Execute the decomposition.
+
+        Returns
+        -------
+        dict with keys: dE, dN, dU (2-D ndarrays), X, Y (meshgrid), x, y (1-D).
+        """
+        def _cb(pct, msg=''):
+            if progress_callback:
+                progress_callback(pct, msg)
+
+        _cb(5, "Reading layer data…")
+        datasets = []
+        for i, cfg in enumerate(self.layer_configs):
+            datasets.append(self._read_layer(cfg))
+            _cb(5 + 10 * (i + 1), f"Read geometry {i + 1}/3")
+
+        # Build common regular grid from the union of all point extents
+        all_x = np.concatenate([d['x'] for d in datasets])
+        all_y = np.concatenate([d['y'] for d in datasets])
+        x = np.linspace(all_x.min(), all_x.max(), self.grid_nx)
+        y = np.linspace(all_y.min(), all_y.max(), self.grid_ny)
+        X, Y = np.meshgrid(x, y)
+
+        _cb(40, "Interpolating LOS data to grid…")
+        grids = []
+        for i, ds in enumerate(datasets):
+            grids.append(self._interpolate(ds, X, Y))
+            _cb(40 + 10 * (i + 1), f"Interpolated geometry {i + 1}/3")
+
+        _cb(75, "Inverting LOS system…")
+        dE, dN, dU, cond_grid = self._invert(grids)
+
+        results = dict(dE=dE, dN=dN, dU=dU, X=X, Y=Y, x=x, y=y,
+                       cond_grid=cond_grid)
+
+        _cb(85, "Adding layers to QGIS…")
+        self._add_to_qgis(results)
+
+        if self.output_path:
+            self._write_output_csv(results)
+
+        if self.ma_enabled:
+            _cb(90, "Running moving area detection on decomposed data…")
+            try:
+                self._run_moving_area(results, _cb)
+            except Exception as e:
+                QgsMessageLog.logMessage(
+                    f"Moving area detection failed: {e}",
+                    'TestPlugin', Qgis.Warning)
+                import traceback
+                QgsMessageLog.logMessage(
+                    traceback.format_exc(), 'TestPlugin', Qgis.Warning)
+
+        _cb(100, "Done!")
+        return results
+
+    # ------------------------------------------------------------------
+    def _read_layer(self, cfg):
+        """Extract (x, y, los, inc, hdg) arrays from a QGIS vector layer."""
+        layer     = cfg['layer']
+        vel_field = cfg['vel_field']
+        inc_field = cfg.get('inc_field')
+        inc_const = float(cfg.get('inc_const', 38.0))
+        hdg_field = cfg.get('hdg_field')
+        hdg_const = float(cfg.get('hdg_const', 350.0))
+
+        fields    = layer.fields()
+        vel_idx   = fields.indexFromName(vel_field)
+        inc_idx   = fields.indexFromName(inc_field) if inc_field else -1
+        hdg_idx   = fields.indexFromName(hdg_field) if hdg_field else -1
+
+        if vel_idx < 0:
+            raise ValueError(
+                f"LOS velocity field '{vel_field}' not found in "
+                f"layer '{layer.name()}'.")
+
+        xs, ys, los_vals, inc_vals, hdg_vals = [], [], [], [], []
+
+        for feat in layer.getFeatures():
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty():
+                continue
+            try:
+                v = float(feat[vel_field])
+            except (ValueError, TypeError):
+                continue
+
+            pt = geom.asPoint()
+            xs.append(pt.x())
+            ys.append(pt.y())
+            los_vals.append(v)
+            inc_vals.append(float(feat[inc_field]) if inc_idx >= 0 else inc_const)
+            hdg_vals.append(float(feat[hdg_field]) if hdg_idx >= 0 else hdg_const)
+
+        if not xs:
+            raise ValueError(
+                f"No valid features found in layer '{layer.name()}'.")
+
+        return dict(
+            x=np.array(xs),
+            y=np.array(ys),
+            los=np.array(los_vals),
+            inc=np.array(inc_vals),
+            hdg=np.array(hdg_vals),
+        )
+
+    # ------------------------------------------------------------------
+    def _interpolate(self, ds, X, Y):
+        """
+        Interpolate LOS / incidence / heading onto the regular grid and
+        compute the unit look-vector components (eE, eN, eU).
+        """
+        from scipy.interpolate import griddata, NearestNDInterpolator
+        from scipy.ndimage import gaussian_filter
+        from scipy.spatial import KDTree
+
+        pts = np.column_stack([ds['x'], ds['y']])
+
+        def _interp(vals):
+            g = griddata(pts, vals, (X, Y), method='linear')
+            nm = np.isnan(g)
+            if nm.any():
+                nn = NearestNDInterpolator(pts, vals)
+                g[nm] = nn(X[nm], Y[nm])
+            return g
+
+        los_g = _interp(ds['los'])
+        inc_g = _interp(ds['inc'])
+        hdg_g = _interp(ds['hdg'])
+
+        if self.smoothing_sigma > 0:
+            s = self.smoothing_sigma
+            los_g = gaussian_filter(los_g, sigma=s, mode='nearest')
+            inc_g = gaussian_filter(inc_g, sigma=s, mode='nearest')
+            hdg_g = gaussian_filter(hdg_g, sigma=s, mode='nearest')
+
+        # Apply distance-based validity mask
+        if self.max_distance > 0:
+            tree = KDTree(pts)
+            dists, _ = tree.query(
+                np.column_stack([X.ravel(), Y.ravel()]), k=1)
+            dist_g = dists.reshape(X.shape)
+            los_g[dist_g > self.max_distance] = np.nan
+
+        # Look-vector components (right-looking convention):
+        #   look_azimuth = heading + 90°  (radar looks right of flight path)
+        look_az = np.deg2rad(hdg_g + 90.0)
+        theta   = np.deg2rad(inc_g)
+        eE = np.sin(theta) * np.sin(look_az)
+        eN = np.sin(theta) * np.cos(look_az)
+        eU = np.cos(theta)
+
+        return dict(eE=eE, eN=eN, eU=eU, los=los_g)
+
+    # ------------------------------------------------------------------
+    def _invert(self, grids):
+        """
+        Solve the LOS decomposition at every grid cell.
+
+        Uses vectorised batched solve for speed with a per-pixel lstsq
+        fallback for exactly-singular cells.  After solving, cells whose
+        look-vector matrix condition number exceeds ``self.cond_threshold``
+        are set to NaN — their geometry is too degenerate for a reliable
+        solution.
+
+        Returns
+        -------
+        dE, dN, dU : 2-D ndarrays  (NaN where masked or unresolvable)
+        cond_grid  : 2-D ndarray   condition numbers (NaN outside valid mask)
+        """
+        if self.solve_north:
+            # Exactly-determined 3×3 system: A x = b
+            # A : (ny, nx, 3, 3)   b : (ny, nx, 3)
+            A = np.stack(
+                [np.stack([g['eE'], g['eN'], g['eU']], axis=-1)
+                 for g in grids],
+                axis=-2)
+            b = np.stack([g['los'] for g in grids], axis=-1)
+
+            valid = (np.all(np.isfinite(A), axis=(-2, -1))
+                     & np.all(np.isfinite(b), axis=-1))
+
+            sol = np.full(A.shape[:-2] + (3,), np.nan)
+            cond_grid = np.full(A.shape[:-2], np.nan)
+
+            if valid.any():
+                # Compute condition numbers (vectorised SVD)
+                cond_vals = np.linalg.cond(A[valid])          # (n_valid,)
+                cond_grid[valid] = cond_vals
+
+                # Separate well-conditioned and ill-conditioned cells
+                well = valid.copy()
+                well[valid] = cond_vals <= self.cond_threshold
+                ill  = valid.copy()
+                ill[valid]  = cond_vals >  self.cond_threshold
+
+                n_ill = int(ill.sum())
+                if n_ill > 0:
+                    pct = n_ill / int(valid.sum()) * 100
+                    QgsMessageLog.logMessage(
+                        f"LOS inversion: {n_ill} cells ({pct:.1f}%) masked "
+                        f"— condition number > {self.cond_threshold:.0e} "
+                        f"(near-parallel geometries).",
+                        'TestPlugin', Qgis.Warning)
+
+                if well.any():
+                    try:
+                        sol[well] = np.linalg.solve(A[well], b[well])
+                    except np.linalg.LinAlgError:
+                        pass
+                    # Per-pixel lstsq fallback for exactly-singular cells
+                    bad = well & ~np.all(np.isfinite(sol), axis=-1)
+                    for idx in zip(*np.where(bad)):
+                        try:
+                            s, _, _, _ = np.linalg.lstsq(
+                                A[idx], b[idx], rcond=None)
+                            sol[idx] = s
+                        except Exception:
+                            pass
+
+            dE = sol[..., 0]
+            dN = sol[..., 1]
+            dU = sol[..., 2]
+
+        else:
+            # Overdetermined 3×2 system (dN assumed = 0)
+            # A : (ny, nx, 3, 2)   b : (ny, nx, 3)
+            A = np.stack(
+                [np.stack([g['eE'], g['eU']], axis=-1) for g in grids],
+                axis=-2)
+            b = np.stack([g['los'] for g in grids], axis=-1)
+
+            valid = (np.all(np.isfinite(A), axis=(-2, -1))
+                     & np.all(np.isfinite(b), axis=-1))
+
+            # Condition number of the rectangular A (via SVD)
+            cond_grid = np.full(A.shape[:-2], np.nan)
+
+            # Normal equations: (A^T A) x = A^T b
+            ATA = np.einsum('...ij,...ik->...jk', A, A)   # (..., 2, 2)
+            ATb = np.einsum('...ij,...i->...j',   A, b)   # (..., 2)
+
+            sol = np.full(A.shape[:-2] + (2,), np.nan)
+
+            if valid.any():
+                cond_vals = np.linalg.cond(A[valid])
+                cond_grid[valid] = cond_vals
+
+                well = valid.copy()
+                well[valid] = cond_vals <= self.cond_threshold
+                ill  = valid.copy()
+                ill[valid]  = cond_vals >  self.cond_threshold
+
+                n_ill = int(ill.sum())
+                if n_ill > 0:
+                    pct = n_ill / int(valid.sum()) * 100
+                    QgsMessageLog.logMessage(
+                        f"LOS inversion: {n_ill} cells ({pct:.1f}%) masked "
+                        f"— condition number > {self.cond_threshold:.0e} "
+                        f"(near-parallel geometries).",
+                        'TestPlugin', Qgis.Warning)
+
+                if well.any():
+                    try:
+                        sol[well] = np.linalg.solve(
+                            ATA[well], ATb[well])
+                    except np.linalg.LinAlgError:
+                        pass
+                    bad = well & ~np.all(np.isfinite(sol), axis=-1)
+                    for idx in zip(*np.where(bad)):
+                        try:
+                            s, _, _, _ = np.linalg.lstsq(
+                                A[idx], b[idx], rcond=None)
+                            sol[idx] = s
+                        except Exception:
+                            pass
+
+            dE = sol[..., 0]
+            dU = sol[..., 1]
+            dN = np.full(dE.shape, np.nan)
+
+        return dE, dN, dU, cond_grid
+
+    # ------------------------------------------------------------------
+    def _add_to_qgis(self, results):
+        """Add E-W, U-D (and optionally N-S) grids as QGIS point memory layers."""
+        X, Y   = results['X'], results['Y']
+        dE, dN, dU = results['dE'], results['dN'], results['dU']
+
+        crs     = self.layer_configs[0]['layer'].crs()
+        crs_str = crs.authid() if (crs and crs.isValid()) else 'EPSG:4326'
+
+        outputs = [('EW_velocity_mm_yr', dE), ('UD_velocity_mm_yr', dU)]
+        if self.solve_north:
+            outputs.append(('NS_velocity_mm_yr', dN))
+
+        for layer_name, grid in outputs:
+            if np.all(~np.isfinite(grid)):
+                continue
+
+            uri = f"Point?crs={crs_str}&field=velocity:double"
+            lyr = QgsVectorLayer(uri, layer_name, 'memory')
+            provider = lyr.dataProvider()
+
+            feats = []
+            for i in range(X.shape[0]):
+                for j in range(X.shape[1]):
+                    v = float(grid[i, j])
+                    if not np.isfinite(v):
+                        continue
+                    feat = QgsFeature()
+                    feat.setGeometry(QgsGeometry.fromPointXY(
+                        QgsPointXY(float(X[i, j]), float(Y[i, j]))))
+                    feat.setAttributes([v])
+                    feats.append(feat)
+
+            provider.addFeatures(feats)
+            self._apply_diverging_renderer(lyr)
+            QgsProject.instance().addMapLayer(lyr)
+            QgsMessageLog.logMessage(
+                f"Added '{layer_name}' ({len(feats)} pts)",
+                'TestPlugin', Qgis.Info)
+
+        # Always add the condition-number diagnostic layer
+        self._add_cond_layer(results)
+
+    # ------------------------------------------------------------------
+    def _add_cond_layer(self, results):
+        """
+        Add a 'LOS_condition_number' point layer coloured from green (well-
+        conditioned) through yellow to red (ill-conditioned / masked).
+        Points above ``self.cond_threshold`` are included but shown in red
+        so the user can see exactly where the geometry is degenerate.
+        """
+        X, Y      = results['X'], results['Y']
+        cond_grid = results.get('cond_grid')
+        if cond_grid is None or np.all(~np.isfinite(cond_grid)):
+            return
+
+        crs     = self.layer_configs[0]['layer'].crs()
+        crs_str = crs.authid() if (crs and crs.isValid()) else 'EPSG:4326'
+
+        uri = (f"Point?crs={crs_str}"
+               f"&field=cond:double&field=masked:integer")
+        lyr = QgsVectorLayer(uri, "LOS_condition_number", "memory")
+        if not lyr.isValid():
+            return
+
+        provider = lyr.dataProvider()
+        feats = []
+        for i in range(X.shape[0]):
+            for j in range(X.shape[1]):
+                c = float(cond_grid[i, j])
+                if not np.isfinite(c):
+                    continue
+                masked = int(c > self.cond_threshold)
+                feat = QgsFeature()
+                feat.setGeometry(QgsGeometry.fromPointXY(
+                    QgsPointXY(float(X[i, j]), float(Y[i, j]))))
+                feat.setAttributes([c, masked])
+                feats.append(feat)
+
+        provider.addFeatures(feats)
+
+        # Graduated renderer: green → yellow → red over [1, cond_threshold * 10]
+        try:
+            from qgis.core import QgsGraduatedSymbolRenderer, QgsRendererRange
+            from qgis.PyQt.QtGui import QColor
+            thr = self.cond_threshold
+            ranges = [
+                QgsRendererRange(1,       thr * 0.1,
+                                 _sym(QColor(0, 200, 0)),   f'< {thr*0.1:.0e}'),
+                QgsRendererRange(thr * 0.1, thr,
+                                 _sym(QColor(255, 200, 0)), f'{thr*0.1:.0e} – {thr:.0e}'),
+                QgsRendererRange(thr,     thr * 10,
+                                 _sym(QColor(220, 20, 20)), f'> {thr:.0e}  (masked)'),
+            ]
+            lyr.setRenderer(QgsGraduatedSymbolRenderer('cond', ranges))
+        except Exception as e:
+            QgsMessageLog.logMessage(
+                f"Cond renderer error: {e}", 'TestPlugin', Qgis.Warning)
+
+        QgsProject.instance().addMapLayer(lyr)
+        QgsMessageLog.logMessage(
+            f"Added 'LOS_condition_number' ({len(feats)} pts, "
+            f"threshold {self.cond_threshold:.0e}).",
+            'TestPlugin', Qgis.Info)
+
+    @staticmethod
+    def _apply_diverging_renderer(layer):
+        """Blue–white–red diverging renderer centred on zero."""
+        try:
+            from qgis.core import QgsGraduatedSymbolRenderer, QgsRendererRange
+            from qgis.PyQt.QtGui import QColor
+
+            vals = [f['velocity'] for f in layer.getFeatures()
+                    if f['velocity'] is not None]
+            if not vals:
+                return
+            v_min, v_max = min(vals), max(vals)
+            mid = 0.0
+            sym_neg = QgsSymbol.defaultSymbol(QgsWkbTypes.PointGeometry)
+            sym_neg.setColor(QColor(220, 20, 20))
+            sym_pos = QgsSymbol.defaultSymbol(QgsWkbTypes.PointGeometry)
+            sym_pos.setColor(QColor(20, 80, 220))
+            sym_zero = QgsSymbol.defaultSymbol(QgsWkbTypes.PointGeometry)
+            sym_zero.setColor(QColor(200, 200, 200))
+
+            ranges = []
+            if v_min < mid:
+                ranges.append(QgsRendererRange(
+                    v_min, mid, sym_neg, f'{v_min:.2f} – 0'))
+            ranges.append(QgsRendererRange(
+                max(mid, v_min), v_max, sym_pos, f'0 – {v_max:.2f}'))
+
+            layer.setRenderer(
+                QgsGraduatedSymbolRenderer('velocity', ranges))
+        except Exception as e:
+            QgsMessageLog.logMessage(
+                f"Renderer error: {e}", 'TestPlugin', Qgis.Warning)
+
+    def _write_output_csv(self, results):
+        """Write the decomposed grids to a CSV file."""
+        X, Y   = results['X'], results['Y']
+        dE, dN, dU = results['dE'], results['dN'], results['dU']
+
+        cols = ['X', 'Y', 'dE_mm_yr', 'dU_mm_yr']
+        if self.solve_north:
+            cols.append('dN_mm_yr')
+
+        with open(self.output_path, 'w', newline='', encoding='utf-8') as fh:
+            writer = csv.DictWriter(fh, fieldnames=cols)
+            writer.writeheader()
+            for i in range(X.shape[0]):
+                for j in range(X.shape[1]):
+                    de, du = float(dE[i, j]), float(dU[i, j])
+                    if not (np.isfinite(de) and np.isfinite(du)):
+                        continue
+                    row = {
+                        'X': round(float(X[i, j]), 2),
+                        'Y': round(float(Y[i, j]), 2),
+                        'dE_mm_yr': round(de, 4),
+                        'dU_mm_yr': round(du, 4),
+                    }
+                    if self.solve_north:
+                        row['dN_mm_yr'] = round(float(dN[i, j]), 4)
+                    writer.writerow(row)
+
+        QgsMessageLog.logMessage(
+            f"Decomposition CSV written: {self.output_path}",
+            'TestPlugin', Qgis.Info)
+
+    # ------------------------------------------------------------------
+    def _run_moving_area(self, results, progress_callback=None):
+        """
+        Detect moving areas on the decomposed displacement data.
+
+        Selects the grid component specified by ``self.ma_component``
+        ('ew', 'ud', 'ns', or 'magnitude'), flattens valid grid cells
+        to a point cloud, runs PSFeatureExtractor → PSTrainer →
+        MovingAreaBoundaryExtractor, and adds results to QGIS.
+        """
+        def _cb(pct, msg=''):
+            if progress_callback:
+                progress_callback(pct, msg)
+
+        X, Y   = results['X'], results['Y']
+        dE, dN, dU = results['dE'], results['dN'], results['dU']
+
+        # Choose velocity component
+        comp = (self.ma_component or 'magnitude').lower()
+        if comp == 'ew':
+            grid = dE
+        elif comp == 'ud':
+            grid = dU
+        elif comp == 'ns':
+            grid = dN
+        else:  # magnitude
+            # Use sqrt(dE² + dU²) — include dN only when solved
+            if self.solve_north and np.any(np.isfinite(dN)):
+                grid = np.sqrt(np.where(np.isfinite(dE), dE**2, 0)
+                               + np.where(np.isfinite(dU), dU**2, 0)
+                               + np.where(np.isfinite(dN), dN**2, 0))
+            else:
+                grid = np.sqrt(np.where(np.isfinite(dE), dE**2, 0)
+                               + np.where(np.isfinite(dU), dU**2, 0))
+            # Propagate NaN where both dE and dU are NaN
+            both_nan = ~np.isfinite(dE) & ~np.isfinite(dU)
+            grid = np.where(both_nan, np.nan, grid)
+
+        # Flatten to valid points
+        flat_x   = X.ravel()
+        flat_y   = Y.ravel()
+        flat_vel = grid.ravel()
+        valid    = np.isfinite(flat_vel)
+
+        if valid.sum() < self.ma_k_neighbors + 1:
+            QgsMessageLog.logMessage(
+                "Moving area detection: not enough valid grid cells "
+                f"({valid.sum()}) for analysis.",
+                'TestPlugin', Qgis.Warning)
+            return
+
+        xy  = np.column_stack([flat_x[valid], flat_y[valid]])
+        vel = flat_vel[valid]
+
+        _cb(91, "Extracting spatial features…")
+        extractor = PSFeatureExtractor(xy, vel, k_neighbors=self.ma_k_neighbors)
+        features  = extractor.extract()
+
+        _cb(93, "Classifying moving vs stable…")
+        trainer = PSTrainer(
+            velocity_threshold=self.ma_vel_threshold,
+            epochs=self.ma_epochs,
+            refinement_iters=self.ma_refinement_iters,
+            use_nn=self.ma_use_nn,
+        )
+        labels = trainer.classify(features, vel)
+
+        n_moving = int(labels.sum())
+        QgsMessageLog.logMessage(
+            f"Moving area detection: {n_moving}/{len(labels)} "
+            f"grid cells classified as moving.",
+            'TestPlugin', Qgis.Info)
+
+        _cb(96, "Adding classification layer to QGIS…")
+        self._add_ma_classification_layer(xy, vel, labels)
+
+        _cb(98, "Extracting moving area boundary…")
+        extractor_boundary = MovingAreaBoundaryExtractor(
+            min_cluster_size=self.ma_min_cluster_size,
+            alpha=self.ma_alpha,
+        )
+        boundary_pts = extractor_boundary.extract_boundaries(xy, labels)
+
+        if boundary_pts and self.ma_output_path:
+            self._write_ma_shapefile(boundary_pts)
+
+        _cb(99, "Moving area detection complete.")
+
+    # ------------------------------------------------------------------
+    def _add_ma_classification_layer(self, xy, velocity, labels):
+        """Add a red/green point layer showing moving / stable classification."""
+        crs     = self.layer_configs[0]['layer'].crs()
+        crs_str = crs.authid() if (crs and crs.isValid()) else 'EPSG:4326'
+
+        uri = (f"Point?crs={crs_str}"
+               f"&field=class:integer&field=velocity:double")
+        lyr = QgsVectorLayer(uri, "MA_classification_decomposed", "memory")
+
+        if not lyr.isValid():
+            QgsMessageLog.logMessage(
+                "Could not create moving area classification layer.",
+                'TestPlugin', Qgis.Warning)
+            return
+
+        provider = lyr.dataProvider()
+        feats = []
+        for i in range(len(xy)):
+            feat = QgsFeature()
+            feat.setGeometry(QgsGeometry.fromPointXY(
+                QgsPointXY(float(xy[i, 0]), float(xy[i, 1]))))
+            feat.setAttributes([int(labels[i]), float(velocity[i])])
+            feats.append(feat)
+        provider.addFeatures(feats)
+
+        # Categorised renderer: 0 = stable (green), 1 = moving (red)
+        from qgis.PyQt.QtGui import QColor
+        cats = []
+        for val, color, label in [
+            (0, QColor(0, 180, 0),   'Stable'),
+            (1, QColor(220, 20, 20), 'Moving'),
+        ]:
+            sym = QgsSymbol.defaultSymbol(QgsWkbTypes.PointGeometry)
+            sym.setColor(color)
+            cats.append(QgsRendererCategory(val, sym, label))
+        lyr.setRenderer(QgsCategorizedSymbolRenderer('class', cats))
+
+        QgsProject.instance().addMapLayer(lyr)
+        QgsMessageLog.logMessage(
+            f"Added 'MA_classification_decomposed' ({len(feats)} pts).",
+            'TestPlugin', Qgis.Info)
+
+    # ------------------------------------------------------------------
+    def _write_ma_shapefile(self, boundary_points):
+        """Write moving area boundary points to a shapefile."""
+        crs = self.layer_configs[0]['layer'].crs()
+
+        fields_list = QgsFields()
+        for f in [
+            QgsField('X',          QVariant.Double),
+            QgsField('Y',          QVariant.Double),
+            QgsField('cluster_id', QVariant.Int),
+            QgsField('component',  QVariant.String),
+        ]:
+            fields_list.append(f)
+
+        transform_context = QgsCoordinateTransformContext()
+        save_options = QgsVectorFileWriter.SaveVectorOptions()
+        save_options.driverName = "ESRI Shapefile"
+
+        writer = QgsVectorFileWriter.create(
+            self.ma_output_path,
+            fields_list,
+            QgsWkbTypes.Point,
+            crs,
+            transform_context,
+            save_options,
+        )
+
+        if writer.hasError() != QgsVectorFileWriter.NoError:
+            raise RuntimeError(
+                f"Error creating MA shapefile: {writer.errorMessage()}")
+
+        comp_label = self.ma_component or 'magnitude'
+        for pt in boundary_points:
+            feat = QgsFeature()
+            feat.setGeometry(QgsGeometry.fromPointXY(
+                QgsPointXY(pt['x'], pt['y'])))
+            feat.setAttributes([
+                pt['x'],
+                pt['y'],
+                pt.get('cluster_id', 0),
+                comp_label,
+            ])
+            writer.addFeature(feat)
+
+        del writer
+
+        QgsMessageLog.logMessage(
+            f"MA boundary shapefile written: {self.ma_output_path}",
+            'TestPlugin', Qgis.Info)
