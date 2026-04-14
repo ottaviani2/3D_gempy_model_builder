@@ -580,12 +580,13 @@ class PyVistaDialog(QDialog):
         self._layout.addWidget(cw)
 
     def display_gempy_model(self, geo_model, export_folder=None,
-                            plot_3d=False, elevation_data=None, transform=None):
+                            plot_3d=False, elevation_data=None, transform=None, model_deep_value=0.0):
         try:
             self.export_folder = export_folder
             self.plot_3d = plot_3d
             self.elevation_data = elevation_data
             self.transform = transform
+            self.model_deep_value = model_deep_value
             pv.set_plot_theme("document")
 
             if self.plotter is not None:
@@ -737,15 +738,51 @@ class PyVistaDialog(QDialog):
                 Xf, Yf, Zf = Xf[valid], Yf[valid], Zf[valid]
             pts3 = np.column_stack([Xf, Yf, Zf.astype(float)])
             tri = Delaunay(np.column_stack([Xf, Yf]))
-            n = len(tri.simplices)
-            data = np.zeros(n, dtype=mesh.Mesh.dtype)
+
+            # Create a 3D box by extruding downwards
+            bottom_z = np.min(Zf) - self.model_deep_value
+            n_top = len(tri.simplices)
+            n_bottom = n_top
+
+            # Find boundary edges of the 2D triangulation
+            bnd_edges = []
+            for i in range(n_top):
+                for j in range(3):
+                    if tri.neighbors[i, j] == -1:
+                        v1 = tri.simplices[i, (j + 1) % 3]
+                        v2 = tri.simplices[i, (j + 2) % 3]
+                        bnd_edges.append((v1, v2))
+
+            n_sides = 2 * len(bnd_edges)
+            total_triangles = n_top + n_bottom + n_sides
+
+            data = np.zeros(total_triangles, dtype=mesh.Mesh.dtype)
+
+            # Top surface
             for i, t in enumerate(tri.simplices):
                 data['vectors'][i] = pts3[t]
+
+            # Bottom surface (flip normals by reversing vertex order)
+            bottom_pts3 = np.column_stack([Xf, Yf, np.full(len(Zf), bottom_z, dtype=float)])
+            for i, t in enumerate(tri.simplices):
+                data['vectors'][n_top + i] = bottom_pts3[[t[0], t[2], t[1]]]
+
+            # Side walls connecting top and bottom boundaries
+            idx = n_top + n_bottom
+            for v1, v2 in bnd_edges:
+                # First triangle of the side quad
+                data['vectors'][idx] = [pts3[v1], bottom_pts3[v1], bottom_pts3[v2]]
+                idx += 1
+                # Second triangle of the side quad
+                data['vectors'][idx] = [pts3[v1], bottom_pts3[v2], pts3[v2]]
+                idx += 1
+
             stl_mesh = mesh.Mesh(data, remove_empty_areas=True)
             stl_path = os.path.join(self.export_folder, "Topography.stl")
             stl_mesh.save(stl_path)
             QgsMessageLog.logMessage(
-                f"Exported: Topography.stl", "TestPlugin", Qgis.Info)
+                f"Exported: Topography.stl (3D Volume, depth={self.model_deep_value})",
+                "TestPlugin", Qgis.Info)
 
     def closeEvent(self, event):
         try:
@@ -1360,7 +1397,7 @@ class testDialog(QDialog, FORM_CLASS):
                     and self.pyvista_panel.isVisible()):
                 self.pyvista_panel.display_gempy_model(
                     geo_model, self.folder_path,
-                    self.plot_3d, elevation_data, transform)
+                    self.plot_3d, elevation_data, transform, self.model_deep_value)
                 self.pyvista_panel.raise_()
             else:
                 if getattr(self, 'pyvista_panel', None):
@@ -1383,7 +1420,7 @@ class testDialog(QDialog, FORM_CLASS):
 
                 self.pyvista_panel.display_gempy_model(
                     geo_model, self.folder_path,
-                    self.plot_3d, elevation_data, transform)
+                    self.plot_3d, elevation_data, transform, self.model_deep_value)
 
             QgsApplication.processEvents()
             self.hide_qgis_progress("3D model displayed successfully!")
