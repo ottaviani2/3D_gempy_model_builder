@@ -5,12 +5,12 @@
 [general]
 name=3D GemPy Model Builder
 qgisMinimumVersion=3.0
-description=3D geological model builder integrating PS-InSAR decomposition and GemPy export
+description=3D geological model builder integrating GemPy export
 version=0.1
 author=1
 email=22
 
-about=A QGIS plugin for building 3D geological models. Accepts geology and PS-InSAR CSV inputs, performs depth-area analysis, and exports data for use with GemPy.
+about=A QGIS plugin for building 3D geological models. Accepts geology CSV inputs and exports data for use with GemPy.
 
 tracker=http://bugs
 repository=http://repo
