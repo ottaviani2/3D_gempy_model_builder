@@ -1,0 +1,38 @@
+# This file contains metadata for your plugin.
+
+# This file should be included when you package your plugin.# Mandatory items:
+
+[general]
+name=3D GemPy Model Builder
+qgisMinimumVersion=3.0
+description=3D geological model builder integrating PS-InSAR decomposition and GemPy export
+version=0.1
+author=Francesco Ottaviani
+email=f.ottaviani5@campus.uniurb.it
+
+about=A QGIS plugin for building 3D geological models. Accepts geology and PS-InSAR CSV inputs, performs depth-area analysis, and exports data for use with GemPy.
+
+tracker=https://github.com/ottaviani2/3D_gempy_model_builder/issues
+repository=https://github.com/ottaviani2/3D_gempy_model_builder
+# End of mandatory metadata
+
+# Recommended items:
+
+hasProcessingProvider=no
+# Uncomment the following line and add your changelog:
+# changelog=
+
+# Tags are comma separated with spaces allowed
+tags=python,geology,3d,gempy,insar
+
+homepage=https://github.com/ottaviani2/3D_gempy_model_builder
+category=Vector
+icon=test_module/icon.png
+# experimental flag
+experimental=False
+
+# deprecated flag (applies to the whole plugin, not just a single version)
+deprecated=False
+
+# If the plugin can run on QGIS Server.
+server=False

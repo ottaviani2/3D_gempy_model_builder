@@ -1,10 +1,10 @@
-# Builds 3D_gempy_model_builder.zip for "Install from ZIP" in QGIS.
+﻿# Builds gempy_model_builder.zip for "Install from ZIP" in QGIS.
 # Wraps everything in a single top-level folder and skips __pycache__ / *.pyc,
 # which QGIS rejects.
 Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
 
 $base = $PSScriptRoot
-$top = "3D_gempy_model_builder"
+$top = "gempy_model_builder"
 $zipPath = Join-Path $base "$top.zip"
 $items = "__init__.py", "metadata.txt", "LICENSE", "README.md", "USER_GUIDE.txt", "methods.pdf", "test_module"
 
