@@ -21,14 +21,13 @@
  *                                                                         *
  ***************************************************************************/
 """
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction
+from qgis.PyQt.QtWidgets import QAction, QApplication
 
 # Initialize Qt resources from file resources.py
 from .resources import *
-# Import the code for the dialog
-from .test_module_dialog import testDialog
+from .dependencies import check_dependencies, show_dependency_dialog
 import os.path
 
 
@@ -180,12 +179,28 @@ class test:
             self.iface.removeToolBarIcon(action)
 
 
+    def _dependencies_ok(self):
+        """Report all missing or broken packages. True if the dialog can open."""
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            problems = check_dependencies()
+        finally:
+            QApplication.restoreOverrideCursor()
+        if not problems:
+            return True
+        return show_dependency_dialog(problems, self.iface.mainWindow())
+
     def run(self):
         """Run method that performs all the real work"""
 
         # Create the dialog with elements (after translation) and keep reference
         # Only create GUI ONCE in callback, so that it will only load when the plugin is started
         if self.first_start == True:
+            if not self._dependencies_ok():
+                return
+            # Imported here because it needs the third-party packages at import
+            # time: QGIS must be able to load the plugin without them.
+            from .test_module_dialog import testDialog
             self.first_start = False
             self.dlg = testDialog()
 

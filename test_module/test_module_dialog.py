@@ -49,11 +49,16 @@ from pyvistaqt import QtInteractor
 import pyvista as pv
 
 from scipy.spatial import Delaunay
-from stl import mesh
+try:
+    from stl import mesh
+except Exception:  # numpy-stl missing or broken: only Topography.stl needs it
+    mesh = None
 try:
     from stl import Mode as _StlMode
-except ImportError:  # older numpy-stl layouts
+except Exception:  # older numpy-stl layouts, or numpy-stl missing or broken
     _StlMode = None
+
+from .dependencies import qgis_python_executable as _qgis_python_executable
 
 # ---------------------------------------------------------------------------
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
@@ -1041,7 +1046,13 @@ class PyVistaDialog(QDialog):
             # the original: (1) a Z-only smoothing of the DTM heights before
             # triangulation, and (2) a pymeshfix mesh-correction pass on the
             # final box.
-            if self.plot_3d and self.elevation_data is not None:
+            if mesh is None:
+                message = ("Topography.stl skipped: numpy-stl is not installed "
+                           "or is broken.")
+                QgsMessageLog.logMessage(message, "TestPlugin", Qgis.Warning)
+                if hasattr(self, 'stl_status_label'):
+                    self.stl_status_label.setText(message)
+            elif self.plot_3d and self.elevation_data is not None:
                 ed = self.elevation_data
                 tr = self.transform
                 rows, cols = ed.shape
@@ -3212,34 +3223,6 @@ class testDialog(QDialog, FORM_CLASS):
 # ---------------------------------------------------------------------------
 # Probabilistic ensemble — background task + parallel compute
 # ---------------------------------------------------------------------------
-def _qgis_python_executable():
-    """Best-effort path to a real ``python`` executable for spawning worker
-    processes.
-
-    Inside a QGIS plugin ``sys.executable`` points at the ``qgis-bin`` launcher,
-    which cannot host a ``multiprocessing`` pool. We look next to the
-    interpreter's prefix for the actual interpreter instead. Returns None when
-    nothing usable is found (the caller then stays sequential).
-    """
-    import sys
-    exe = sys.executable or ""
-    if os.path.basename(exe).lower().startswith('python'):
-        return exe
-    candidates = [
-        os.path.join(sys.exec_prefix, 'python.exe'),
-        os.path.join(sys.exec_prefix, 'pythonw.exe'),
-        os.path.join(sys.exec_prefix, 'python3.exe'),
-        os.path.join(sys.exec_prefix, 'bin', 'python3'),
-        os.path.join(sys.exec_prefix, 'bin', 'python'),
-        os.path.join(sys.base_exec_prefix, 'python.exe'),
-        os.path.join(sys.base_exec_prefix, 'bin', 'python3'),
-    ]
-    for cand in candidates:
-        if cand and os.path.exists(cand):
-            return cand
-    return None
-
-
 def aggregate_ensemble(blocks, params):
     """Aggregate a list of int32 lithology blocks into per-cell modal
     probability, Shannon entropy and modal-lithology fields, write the .npy

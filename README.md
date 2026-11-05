@@ -62,13 +62,13 @@ Then enable it in QGIS via **Plugins → Manage and Install Plugins → Installe
 #### Required packages
 
 ```bash
-<qgis-python> -m pip install numpy scipy rasterio pandas gempy gempy-viewer pyvista pyvistaqt numpy-stl pymeshfix pymeshlab
+<qgis-python> -m pip install numpy scipy pandas shapely rasterio pyvista pyvistaqt gempy gempy-viewer numpy-stl
 ```
 
 #### Example (Windows, QGIS 3.38)
 
 ```bat
-"C:\Program Files\QGIS 3.38\apps\Python312\python.exe" -m pip install numpy scipy rasterio pandas gempy gempy-viewer pyvista pyvistaqt numpy-stl pymeshfix pymeshlab
+"C:\Program Files\QGIS 3.38\apps\Python312\python.exe" -m pip install numpy scipy pandas shapely rasterio pyvista pyvistaqt gempy gempy-viewer numpy-stl
 ```
 
 ### 3. Restart QGIS
@@ -80,38 +80,35 @@ Then enable it in QGIS via **Plugins → Manage and Install Plugins → Installe
 
 ## Dependency Reference
 
+The plugin checks these packages when you open it. It lists all the missing or broken ones in one window, with the commands that fix them.
+
 ### Required packages
 
-> [!WARNING]
-> The six packages below are **hard required** — they are imported at module level with no fallback. The plugin will crash immediately on startup or at model-compute time if any of them are missing.
+| Package | pip install name | Why it is needed |
+|---------|-----------------|------------------|
+| `numpy` | `numpy` | Numerical operations |
+| `scipy` | `scipy` | Interpolation and spatial indexing |
+| `pandas` | `pandas` | Reading and rewriting the input CSV files |
+| `shapely` | `shapely` | AOI clipping and rotation |
+| `rasterio` | `rasterio` | Reading the DTM, GeoTIFF export |
+| `pyvista` | `pyvista` | 3D meshes and rendering |
+| `pyvistaqt` | `pyvistaqt` | 3D viewer inside the dialog |
+| `gempy` | `gempy` | Geological modelling engine |
+| `gempy_viewer` | `gempy-viewer` | Model visualisation |
+
+### Optional package
 
 | Package | pip install name | Why it is needed | If missing |
 |---------|-----------------|------------------|------------|
-| `numpy` | `numpy` | Foundation for all numerical operations: array math, coordinate transforms, mesh geometry, velocity field computations | **Plugin crashes** |
-| `scipy` | `scipy` | Spatial indexing (`cKDTree`) for nearest-neighbour queries; `griddata` interpolation for surface reconstruction; `ndimage` morphological operations for raster clean-up | **Plugin crashes** |
-| `pyvista` | `pyvista` | Builds and renders 3D meshes (geological surfaces, topography grid, exported STL/VTK/OBJ/PLY files) | **Plugin crashes** |
-| `pyvistaqt` | `pyvistaqt` | Embeds the PyVista 3D viewport as a Qt widget inside the QGIS dialog | **Plugin crashes** |
-| `gempy` | `gempy` | Core implicit geological modelling engine — interpolates formation surfaces from scattered input points using a co-kriging method | **Plugin crashes** at compute time |
-| `gempy-viewer` | `gempy-viewer` | Fallback visualisation used when the primary PyVista view is unavailable; also used for GemPy result inspection | **Plugin crashes** at compute time |
-
-### Packages with graceful fallback
+| `stl` | `numpy-stl` | Writing `Topography.stl` | The topography STL is skipped; everything else still works |
 
 > [!WARNING]
-> These packages do **not** crash the plugin on startup, but missing them silently disables major functionality. Read the "If missing" column carefully before deciding to skip any of them.
-
-| Package | pip install name | Why it is needed | If missing |
-|---------|-----------------|------------------|------------|
-| `rasterio` | `rasterio` | Reads DTM/DEM raster files (GeoTIFF) to clip the 3D geological model to the topographic surface; also writes the GeoTIFF geological map export | A warning is logged; DTM loading is skipped and the model has **no topography clipping**; GeoTIFF export is silently disabled |
-| `pandas` | `pandas` | Reads and rewrites the geology / orientation CSV files during the GemPy import pipeline (AOI clipping, axis-alignment rotation, Arrow-string compatibility) | The **GemPy compute step raises an `ImportError`** at runtime; the plugin loads but cannot build a model |
-| `numpy-stl` | `numpy-stl` | Reads and writes STL mesh files for the topography surface export | STL topography export is silently skipped; other mesh formats (VTK, OBJ, PLY) are unaffected |
-| `pymeshfix` | `pymeshfix` | Watertight mesh repair (Marco Attene's MeshFix) applied to every surface before STL export — fixes self-intersections, non-manifold edges and holes that PyVista's `clean` alone cannot | A warning is logged; export falls back to PyVista clean/normals only, so meshes may still contain non-manifold edges |
-| `pymeshlab` | `pymeshlab` | MeshLab's geometry-processing engine; removes folded / sliver faces along the topography boundary (`meshing_remove_folded_faces` + degenerate/non-manifold cleanup) before the watertight pymeshfix pass | A warning is logged; folded-face removal is skipped, so the topography box may keep folded boundary triangles (the pymeshfix watertight pass still runs) |
-
-> [!WARNING]
-> `rasterio` is particularly important. Without it the geological model is computed without a topographic boundary, which produces unrealistic results for any near-surface geology. Install it unless your model extent is entirely subsurface.
-
-> [!NOTE]
-> `pandas` missing does not crash the plugin on startup, but the GemPy compute step will raise an `ImportError` the first time it is used. Install it before attempting to build a model.
+> Install `numpy-stl`, **not** `stl`. The PyPI package `stl` is unrelated and overwrites files of `numpy-stl`, which causes `AttributeError: module 'stl' has no attribute 'BaseStl'`. To fix it:
+>
+> ```bash
+> <qgis-python> -m pip uninstall -y stl numpy-stl
+> <qgis-python> -m pip install numpy-stl
+> ```
 
 ---
 

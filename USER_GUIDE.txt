@@ -245,11 +245,16 @@ COMMON ERRORS
     extent. Check that the formation data are well inside the DTM bounding
     box and that the model depth is large enough to contain the data.
 
-"numpy-stl not installed"
-    The topography STL export requires numpy-stl. Install it from the
-    QGIS Python console:
-        import subprocess, sys
-        subprocess.run([sys.executable, "-m", "pip", "install", "numpy-stl"])
+"Topography.stl skipped: numpy-stl is not installed or is broken"
+    When the plugin starts, it lists every missing or broken package and the
+    commands that fix them. Run those commands in a terminal, not in the QGIS
+    Python console, then restart QGIS.
+
+"module 'stl' has no attribute 'BaseStl'"
+    The unrelated package "stl" overwrote files of "numpy-stl". Run:
+        <qgis-python> -m pip uninstall -y stl numpy-stl
+        <qgis-python> -m pip install numpy-stl
+    Never install "stl": the correct package is "numpy-stl".
 
 
 ================================================================================
