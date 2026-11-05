@@ -128,6 +128,12 @@ The plugin checks these packages when you open it. It lists all the missing or b
 
 ---
 
+## Test Data
+
+The [`test_data`](test_data) folder has a small example dataset for trying the plugin, with instructions.
+
+---
+
 ## Usage Overview
 
 1. Open the plugin from the QGIS toolbar or **Plugins** menu.
